@@ -1,0 +1,76 @@
+{
+  "entities": {
+    "Message": {
+      "title": "Message",
+      "description": "A chat message between user and assistant",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "role": { "type": "string", "enum": ["user", "assistant"] },
+        "content": { "type": "string" },
+        "timestamp": { "type": "string", "format": "date-time" },
+        "userId": { "type": "string" }
+      },
+      "required": ["id", "role", "content", "timestamp", "userId"]
+    },
+    "UserSettings": {
+      "title": "UserSettings",
+      "description": "User preferences and profile information including statistics",
+      "type": "object",
+      "properties": {
+        "displayName": { "type": "string" },
+        "studyMethod": { "type": "string", "enum": ["Pomodoro", "Active Recall", "Spaced Repetition", "Feynman Technique"] },
+        "notificationsEnabled": { "type": "boolean" },
+        "dailyGoal": { "type": "integer" },
+        "reminderTime": { "type": "string" },
+        "blockedApps": { "type": "array", "items": { "type": "string" } },
+        "allowedTools": { "type": "array", "items": { "type": "string" } },
+        "subjects": { "type": "array", "items": { "type": "string" } },
+        "updatedAt": { "type": "string", "format": "date-time" },
+        "stats": {
+          "type": "object",
+          "properties": {
+            "streak": { "type": "integer" },
+            "weeklyHours": { "type": "number" },
+            "todayHours": { "type": "number" },
+            "level": { "type": "integer" },
+            "xp": { "type": "integer" },
+            "focusScore": { "type": "integer" },
+            "sessionsCompleted": { "type": "integer" },
+            "mostStudiedSubject": { "type": "string" },
+            "lastActiveDate": { "type": "string" },
+            "subjectStats": { "type": "object" }
+          }
+        }
+      },
+      "required": ["displayName", "studyMethod", "notificationsEnabled", "subjects"]
+    },
+    "StudyFile": {
+      "title": "StudyFile",
+      "description": "Uploaded study material",
+      "type": "object",
+      "properties": {
+        "name": { "type": "string" },
+        "type": { "type": "string" },
+        "content": { "type": "string" },
+        "uploadedAt": { "type": "string", "format": "date-time" },
+        "userId": { "type": "string" }
+      },
+      "required": ["name", "type", "content", "uploadedAt", "userId"]
+    }
+  },
+  "firestore": {
+    "/messages": {
+      "schema": "Message",
+      "description": "Collection of chat messages"
+    },
+    "/users/{userId}": {
+      "schema": "UserSettings",
+      "description": "User profile and settings"
+    },
+    "/studyFiles": {
+      "schema": "StudyFile",
+      "description": "Collection of study materials"
+    }
+  }
+}
