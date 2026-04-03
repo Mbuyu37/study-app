@@ -32,6 +32,11 @@ service cloud.firestore {
       return isAuthenticated() && request.auth.uid == userId;
     }
 
+    function isValidEmail(email) {
+      return email is string &&
+        email.matches("^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\\.[a-zA-Z]{2,}$");
+    }
+
     function isValidMessage(data) {
       return data.keys().hasAll(['id', 'role', 'content', 'timestamp', 'userId']) &&
              data.id is string &&
@@ -56,8 +61,9 @@ service cloud.firestore {
     }
 
     function isValidUserSettings(data) {
-      return data.keys().hasAll(['displayName', 'studyMethod', 'notificationsEnabled', 'updatedAt', 'subjects']) &&
+      return data.keys().hasAll(['displayName', 'email', 'studyMethod', 'notificationsEnabled', 'updatedAt', 'subjects']) &&
              data.displayName is string && data.displayName.size() > 0 && data.displayName.size() < 100 &&
+             data.email is string && isValidEmail(data.email) &&
              data.studyMethod in ['Pomodoro', 'Active Recall', 'Spaced Repetition', 'Feynman Technique'] &&
              data.notificationsEnabled is bool &&
              data.updatedAt is timestamp &&

@@ -102,6 +102,7 @@ interface UserStats {
 
 interface UserSettings {
   displayName: string;
+  email: string;
   studyMethod: string;
   notificationsEnabled: boolean;
   dailyGoal: number;
@@ -130,6 +131,7 @@ const DEFAULT_STATS: UserStats = {
 
 const DEFAULT_SETTINGS: UserSettings = {
   displayName: '',
+  email: '',
   studyMethod: 'Pomodoro',
   notificationsEnabled: true,
   dailyGoal: 2,
@@ -885,6 +887,7 @@ export default function App() {
         const initialSettings = {
           ...DEFAULT_SETTINGS,
           displayName: user.displayName || 'Student',
+          email: user.email || '',
           updatedAt: serverTimestamp()
         };
         setDoc(userDocRef, initialSettings).catch(err => {
@@ -915,7 +918,23 @@ export default function App() {
     if (isLoggingIn) return;
     setIsLoggingIn(true);
     try {
-      await signInWithPopup(auth, googleProvider);
+      const userCredential = await signInWithPopup(auth, googleProvider);
+      const user = userCredential.user;
+      
+      // Explicitly initialize user data if it doesn't exist
+      const userDocRef = doc(db, 'users', user.uid);
+      const docSnap = await getDoc(userDocRef);
+      
+      if (!docSnap.exists()) {
+        const initialSettings = {
+          ...DEFAULT_SETTINGS,
+          displayName: user.displayName || 'Student',
+          email: user.email || '',
+          updatedAt: serverTimestamp()
+        };
+        await setDoc(userDocRef, initialSettings);
+      }
+      
       setIsAuthModalOpen(false);
       setError(null);
     } catch (error: any) {
@@ -938,9 +957,22 @@ export default function App() {
     try {
       if (authMode === 'signup') {
         const userCredential = await createUserWithEmailAndPassword(auth, email, password);
+        const user = userCredential.user;
+        
         if (displayName) {
-          await updateProfile(userCredential.user, { displayName });
+          await updateProfile(user, { displayName });
         }
+        
+        // Explicitly initialize user data in Firestore
+        const userDocRef = doc(db, 'users', user.uid);
+        const initialSettings = {
+          ...DEFAULT_SETTINGS,
+          displayName: displayName || 'Student',
+          email: email,
+          updatedAt: serverTimestamp()
+        };
+        await setDoc(userDocRef, initialSettings);
+        
         toast.success("Account created successfully!");
       } else {
         await signInWithEmailAndPassword(auth, email, password);

@@ -19,6 +19,7 @@
       "type": "object",
       "properties": {
         "displayName": { "type": "string" },
+        "email": { "type": "string", "format": "email" },
         "studyMethod": { "type": "string", "enum": ["Pomodoro", "Active Recall", "Spaced Repetition", "Feynman Technique"] },
         "notificationsEnabled": { "type": "boolean" },
         "dailyGoal": { "type": "integer" },
