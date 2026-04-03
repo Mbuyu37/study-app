@@ -32,7 +32,8 @@ import {
   RotateCcw,
   Upload,
   Moon,
-  Sun
+  Sun,
+  Search
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import Markdown from 'react-markdown';
@@ -283,6 +284,17 @@ export default function App() {
   const [selectedExitOption, setSelectedExitOption] = useState<number | null>(null);
   const [showExitExplanation, setShowExitExplanation] = useState(false);
   const [exitReason, setExitReason] = useState<'quit' | 'finish'>('quit');
+  
+  // AI Search in Timer State
+  const [isAiSearchOpen, setIsAiSearchOpen] = useState(false);
+  const [aiSearchInput, setAiSearchInput] = useState('');
+  const [aiSearchResponse, setAiSearchResponse] = useState('');
+  const [isSearchingAi, setIsSearchingAi] = useState(false);
+
+  // AI Topic Generation State
+  const [isGeneratingTopics, setIsGeneratingTopics] = useState(false);
+  const [suggestedTopics, setSuggestedTopics] = useState<string[]>([]);
+  const [customSubject, setCustomSubject] = useState('');
 
   const messagesEndRef = useRef<HTMLDivElement>(null);
 
@@ -1008,6 +1020,49 @@ export default function App() {
     }
   };
 
+  const handleAiSearch = async () => {
+    if (!aiSearchInput.trim() || isSearchingAi) return;
+    setIsSearchingAi(true);
+    setAiSearchResponse('');
+    try {
+      const response = await ai.models.generateContent({
+        model: "gemini-3-flash-preview",
+        contents: [{ role: 'user', parts: [{ text: aiSearchInput }] }],
+        config: {
+          systemInstruction: `You are 'Study Focus', a quick academic lookup tool. Provide a concise, accurate answer to the user's question. They are currently in a focused study session for: ${sessionTopic}. Their goal is: ${sessionGoal}. Keep your response helpful but brief so they can get back to studying quickly.`,
+        }
+      });
+      setAiSearchResponse(response.text || "No response generated.");
+    } catch (err) {
+      console.error("AI Search error:", err);
+      setAiSearchResponse("Failed to get response. Please try again.");
+    } finally {
+      setIsSearchingAi(false);
+    }
+  };
+
+  const generateSuggestedTopics = async () => {
+    if (!customSubject.trim() || isGeneratingTopics) return;
+    setIsGeneratingTopics(true);
+    setSuggestedTopics([]);
+    try {
+      const response = await ai.models.generateContent({
+        model: "gemini-3-flash-preview",
+        contents: [{ role: 'user', parts: [{ text: `Generate 5 specific study topics or sub-topics for the subject: ${customSubject}. Return only a comma-separated list of topics.` }] }],
+        config: {
+          systemInstruction: "You are an academic advisor. Provide 5 specific, high-value study topics for the given subject. Return only the topics separated by commas, no other text.",
+        }
+      });
+      const topics = (response.text || "").split(',').map(t => t.trim()).filter(t => t.length > 0);
+      setSuggestedTopics(topics);
+    } catch (err) {
+      console.error("Topic generation error:", err);
+      toast.error("Failed to generate topics.");
+    } finally {
+      setIsGeneratingTopics(false);
+    }
+  };
+
   const handleSend = async () => {
     if (!input.trim() || isLoading || !user) return;
 
@@ -1390,19 +1445,28 @@ export default function App() {
               </p>
               <div className="flex flex-col sm:flex-row items-center justify-center gap-4 mt-8">
                 <button 
-                  onClick={() => handleLogin('signin')}
-                  className="w-full sm:w-auto px-8 py-4 bg-indigo-600 hover:bg-indigo-500 text-white rounded-2xl text-lg font-semibold transition-all shadow-xl shadow-indigo-900/40 flex items-center justify-center gap-3"
+                  onClick={handleGoogleLogin}
+                  className="w-full sm:w-auto px-8 py-4 bg-white text-zinc-950 rounded-2xl text-lg font-bold transition-all shadow-xl shadow-white/10 flex items-center justify-center gap-3 hover:scale-105"
                 >
-                  <LogIn className="w-6 h-6" />
-                  Sign In
+                  <img src="https://www.gstatic.com/firebasejs/ui/2.0.0/images/auth/google.svg" alt="Google" className="w-6 h-6" />
+                  Continue with Google
                 </button>
-                <button 
-                  onClick={() => handleLogin('signup')}
-                  className="w-full sm:w-auto px-8 py-4 bg-zinc-900 border border-zinc-800 hover:bg-zinc-800 text-white rounded-2xl text-lg font-semibold transition-all shadow-xl flex items-center justify-center gap-3"
-                >
-                  <User className="w-6 h-6" />
-                  Create Account
-                </button>
+                <div className="flex items-center gap-4 w-full sm:w-auto">
+                  <button 
+                    onClick={() => handleLogin('signin')}
+                    className="flex-1 sm:flex-none px-6 py-4 bg-zinc-900 border border-zinc-800 hover:bg-zinc-800 text-white rounded-2xl text-sm font-semibold transition-all shadow-xl flex items-center justify-center gap-2"
+                  >
+                    <LogIn className="w-5 h-5" />
+                    Sign In
+                  </button>
+                  <button 
+                    onClick={() => handleLogin('signup')}
+                    className="flex-1 sm:flex-none px-6 py-4 bg-zinc-900 border border-zinc-800 hover:bg-zinc-800 text-white rounded-2xl text-sm font-semibold transition-all shadow-xl flex items-center justify-center gap-2"
+                  >
+                    <User className="w-5 h-5" />
+                    Join Free
+                  </button>
+                </div>
               </div>
             </div>
           </div>
@@ -2540,24 +2604,51 @@ export default function App() {
                   </div>
                 )}
 
-                {/* Subject Selection */}
+                {/* Subject Input & Topic Generation */}
                 <div className="space-y-4">
                   <label className="text-xs font-bold text-zinc-500 uppercase tracking-widest">Subject</label>
-                  <div className="flex flex-wrap gap-2">
-                    {userSettings.subjects.map((subject) => (
-                      <button
-                        key={subject}
-                        onClick={() => setSelectedSubject(subject)}
-                        className={`px-4 py-2 rounded-xl text-xs font-bold transition-all border ${
-                          selectedSubject === subject 
-                            ? userSettings.theme === 'dark' ? 'bg-white text-indigo-600 border-white shadow-lg' : 'bg-indigo-600 text-white border-indigo-600 shadow-lg shadow-indigo-900/20'
-                            : userSettings.theme === 'dark' ? 'bg-zinc-950 border-zinc-800 text-zinc-500 hover:border-zinc-700' : 'bg-zinc-50 border-zinc-200 text-zinc-500 hover:border-zinc-300'
-                        }`}
-                      >
-                        {subject}
-                      </button>
-                    ))}
+                  <div className="flex gap-2">
+                    <input 
+                      type="text" 
+                      placeholder="Enter subject (e.g. Physics, History...)"
+                      value={customSubject}
+                      onChange={(e) => setCustomSubject(e.target.value)}
+                      className="flex-1 bg-zinc-950 border border-zinc-800 rounded-xl px-4 py-3 text-sm focus:ring-2 focus:ring-indigo-500 outline-none transition-all placeholder:text-zinc-700 text-white"
+                    />
+                    <button 
+                      onClick={generateSuggestedTopics}
+                      disabled={!customSubject.trim() || isGeneratingTopics}
+                      className="px-4 py-3 bg-indigo-600/10 border border-indigo-500/30 text-indigo-400 rounded-xl text-xs font-bold hover:bg-indigo-600/20 disabled:opacity-50 transition-all flex items-center gap-2"
+                    >
+                      {isGeneratingTopics ? <Loader2 className="w-4 h-4 animate-spin" /> : <Brain className="w-4 h-4" />}
+                      Generate Topics
+                    </button>
                   </div>
+
+                  {suggestedTopics.length > 0 && (
+                    <motion.div 
+                      initial={{ opacity: 0, y: 10 }}
+                      animate={{ opacity: 1, y: 0 }}
+                      className="space-y-2"
+                    >
+                      <label className="text-[10px] font-bold text-zinc-600 uppercase tracking-widest">Suggested Topics</label>
+                      <div className="flex flex-wrap gap-2">
+                        {suggestedTopics.map((topic, i) => (
+                          <button
+                            key={i}
+                            onClick={() => setSessionTopic(topic)}
+                            className={`px-3 py-1.5 rounded-lg text-[11px] font-medium transition-all border ${
+                              sessionTopic === topic 
+                                ? 'bg-indigo-600 text-white border-indigo-600 shadow-md' 
+                                : 'bg-zinc-900 border-zinc-800 text-zinc-400 hover:border-zinc-700'
+                            }`}
+                          >
+                            {topic}
+                          </button>
+                        ))}
+                      </div>
+                    </motion.div>
+                  )}
                 </div>
 
                 {/* Topic & Goal */}
@@ -2613,6 +2704,16 @@ export default function App() {
             </div>
 
             <div className="relative z-10 w-full max-w-2xl flex flex-col items-center text-center space-y-12">
+              {/* AI Search Trigger */}
+              <button 
+                onClick={() => setIsAiSearchOpen(true)}
+                className="absolute -top-12 right-0 md:-right-12 w-14 h-14 rounded-full bg-zinc-900 border border-zinc-800 flex items-center justify-center text-zinc-500 hover:text-indigo-400 hover:border-indigo-400/50 transition-all group"
+                title="AI Quick Lookup"
+              >
+                <Search className="w-6 h-6 group-hover:scale-110 transition-transform" />
+                <span className="absolute -bottom-8 left-1/2 -translate-x-1/2 text-[10px] font-bold text-zinc-600 uppercase tracking-widest opacity-0 group-hover:opacity-100 transition-opacity whitespace-nowrap">AI Search</span>
+              </button>
+
               {/* Header */}
               <div className="space-y-2">
                 <div className="flex items-center justify-center gap-2 text-xs font-bold text-indigo-400 uppercase tracking-[0.3em]">
@@ -2706,6 +2807,83 @@ export default function App() {
               </div>
             </div>
           </motion.div>
+        )}
+      </AnimatePresence>
+
+      {/* AI Quick Search Modal (during timer) */}
+      <AnimatePresence>
+        {isAiSearchOpen && (
+          <div className="fixed inset-0 z-[250] flex items-center justify-center p-4">
+            <motion.div 
+              initial={{ opacity: 0 }}
+              animate={{ opacity: 1 }}
+              exit={{ opacity: 0 }}
+              onClick={() => setIsAiSearchOpen(false)}
+              className="absolute inset-0 bg-black/60 backdrop-blur-sm"
+            />
+            <motion.div 
+              initial={{ opacity: 0, scale: 0.9, y: 20 }}
+              animate={{ opacity: 1, scale: 1, y: 0 }}
+              exit={{ opacity: 0, scale: 0.9, y: 20 }}
+              className="relative w-full max-w-xl bg-zinc-900 border border-zinc-800 rounded-[2.5rem] shadow-2xl overflow-hidden flex flex-col max-h-[80vh]"
+            >
+              <div className="p-6 border-b border-zinc-800 flex items-center justify-between">
+                <div className="flex items-center gap-3">
+                  <div className="w-10 h-10 rounded-2xl bg-indigo-600/20 flex items-center justify-center">
+                    <Search className="w-5 h-5 text-indigo-400" />
+                  </div>
+                  <div>
+                    <h2 className="text-xl font-serif italic font-bold text-white">AI Quick Lookup</h2>
+                    <p className="text-[10px] text-zinc-500 font-bold uppercase tracking-widest">Ask anything while you study</p>
+                  </div>
+                </div>
+                <button 
+                  onClick={() => setIsAiSearchOpen(false)}
+                  className="p-2 text-zinc-500 hover:text-white hover:bg-zinc-800 rounded-xl transition-all"
+                >
+                  <X className="w-5 h-5" />
+                </button>
+              </div>
+
+              <div className="flex-1 overflow-y-auto p-8 space-y-6 scrollbar-thin scrollbar-thumb-zinc-800">
+                <div className="space-y-4">
+                  <div className="relative">
+                    <input 
+                      type="text" 
+                      placeholder="Ask a quick question..."
+                      value={aiSearchInput}
+                      onChange={(e) => setAiSearchInput(e.target.value)}
+                      onKeyDown={(e) => e.key === 'Enter' && handleAiSearch()}
+                      className="w-full bg-zinc-950 border border-zinc-800 rounded-2xl px-5 py-4 text-sm focus:ring-2 focus:ring-indigo-500 outline-none transition-all pr-12 text-white"
+                    />
+                    <button 
+                      onClick={handleAiSearch}
+                      disabled={isSearchingAi || !aiSearchInput.trim()}
+                      className="absolute right-3 top-1/2 -translate-y-1/2 p-2 text-indigo-400 hover:text-indigo-300 disabled:text-zinc-700 transition-colors"
+                    >
+                      {isSearchingAi ? <Loader2 className="w-5 h-5 animate-spin" /> : <Send className="w-5 h-5" />}
+                    </button>
+                  </div>
+                </div>
+
+                {aiSearchResponse && (
+                  <motion.div 
+                    initial={{ opacity: 0, y: 10 }}
+                    animate={{ opacity: 1, y: 0 }}
+                    className="p-6 bg-zinc-950 border border-zinc-800 rounded-2xl space-y-4"
+                  >
+                    <div className="flex items-center gap-2 text-[10px] font-bold text-indigo-400 uppercase tracking-widest">
+                      <Bot className="w-3 h-3" />
+                      AI Response
+                    </div>
+                    <div className="text-sm text-zinc-300 leading-relaxed prose prose-invert prose-sm max-w-none">
+                      <Markdown>{aiSearchResponse}</Markdown>
+                    </div>
+                  </motion.div>
+                )}
+              </div>
+            </motion.div>
+          </div>
         )}
       </AnimatePresence>
 
