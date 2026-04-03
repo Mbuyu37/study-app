@@ -33,10 +33,31 @@ import {
   Upload,
   Moon,
   Sun,
-  Search
+  Search,
+  ChevronRight,
+  Star,
+  Zap,
+  Users,
+  Globe,
+  ArrowRight,
+  Play,
+  Check
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import Markdown from 'react-markdown';
+import { 
+  BarChart, 
+  Bar, 
+  XAxis, 
+  YAxis, 
+  CartesianGrid, 
+  Tooltip, 
+  ResponsiveContainer, 
+  LineChart, 
+  Line, 
+  AreaChart, 
+  Area 
+} from 'recharts';
 import { auth, db, googleProvider } from './firebase';
 import { signInWithPopup, signOut, onAuthStateChanged, User as FirebaseUser, createUserWithEmailAndPassword, signInWithEmailAndPassword, updateProfile } from 'firebase/auth';
 import { collection, addDoc, query, where, orderBy, onSnapshot, serverTimestamp, Timestamp, getDocs, doc, getDocFromServer, writeBatch, setDoc, getDoc, deleteDoc } from 'firebase/firestore';
@@ -86,6 +107,11 @@ interface StudyFile {
   userId: string;
 }
 
+interface Flashcard {
+  question: string;
+  answer: string;
+}
+
 interface UserStats {
   streak: number;
   weeklyHours: number;
@@ -99,6 +125,9 @@ interface UserStats {
   subjectStats: Record<string, SubjectStats>;
   totalQuizzesTaken: number;
   averageQuizScore: number;
+  dailyXpHistory: { date: string; xp: number }[];
+  weeklyStudyHistory: { day: string; hours: number }[];
+  quizScoreHistory: { date: string; score: number; subject: string }[];
 }
 
 interface UserSettings {
@@ -113,6 +142,8 @@ interface UserSettings {
   subjects: string[];
   theme: 'light' | 'dark';
   stats: UserStats;
+  badges: string[];
+  weeklyStudyPlan: { day: string; focus: string; tasks: string[] }[] | null;
 }
 
 const DEFAULT_STATS: UserStats = {
@@ -128,6 +159,17 @@ const DEFAULT_STATS: UserStats = {
   subjectStats: {},
   totalQuizzesTaken: 0,
   averageQuizScore: 0,
+  dailyXpHistory: [],
+  weeklyStudyHistory: [
+    { day: 'Mon', hours: 0 },
+    { day: 'Tue', hours: 0 },
+    { day: 'Wed', hours: 0 },
+    { day: 'Thu', hours: 0 },
+    { day: 'Fri', hours: 0 },
+    { day: 'Sat', hours: 0 },
+    { day: 'Sun', hours: 0 },
+  ],
+  quizScoreHistory: [],
 };
 
 const DEFAULT_SETTINGS: UserSettings = {
@@ -142,6 +184,8 @@ const DEFAULT_SETTINGS: UserSettings = {
   subjects: ['Mathematics', 'History', 'Science', 'Literature'],
   theme: 'dark',
   stats: DEFAULT_STATS,
+  badges: [],
+  weeklyStudyPlan: null,
 };
 
 const MOTIVATIONAL_QUOTES = [
@@ -253,6 +297,9 @@ export default function App() {
   const [studyFiles, setStudyFiles] = useState<StudyFile[]>([]);
   const [isUploading, setIsUploading] = useState(false);
   const [isFilesModalOpen, setIsFilesModalOpen] = useState(false);
+  const [fileSearchQuery, setFileSearchQuery] = useState('');
+  const [fileSortBy, setFileSortBy] = useState<'name' | 'date' | 'type'>('date');
+  const [isGeneratingPlan, setIsGeneratingPlan] = useState(false);
   
   // Summarizer State
   const [isSummarizerModalOpen, setIsSummarizerModalOpen] = useState(false);
@@ -261,6 +308,12 @@ export default function App() {
   const [summaryType, setSummaryType] = useState<'Bullet Points' | 'Key Concepts' | 'Flashcards'>('Bullet Points');
   const [summaryNotes, setSummaryNotes] = useState('');
   const [summaryTopic, setSummaryTopic] = useState('');
+
+  // Flashcard Study State
+  const [isFlashcardStudyOpen, setIsFlashcardStudyOpen] = useState(false);
+  const [flashcards, setFlashcards] = useState<Flashcard[]>([]);
+  const [currentFlashcardIndex, setCurrentFlashcardIndex] = useState(0);
+  const [isFlashcardFlipped, setIsFlashcardFlipped] = useState(false);
   
   // Timer State
   const [sessionDuration, setSessionDuration] = useState(25); // Default 25 mins
@@ -297,6 +350,55 @@ export default function App() {
   const [customSubject, setCustomSubject] = useState('');
 
   const messagesEndRef = useRef<HTMLDivElement>(null);
+
+  // XP & Leveling Constants
+  const XP_PER_LEVEL = 500;
+  const XP_PER_SESSION_MIN = 2; // XP per minute of study
+  const XP_QUIZ_BASE = 20;
+  const XP_QUIZ_CORRECT = 10;
+  const XP_SUMMARY = 15;
+
+  const calculateLevel = (xp: number) => Math.floor(xp / XP_PER_LEVEL) + 1;
+
+  const checkMilestones = (stats: UserStats) => {
+    const newBadges: string[] = [...(userSettings.badges || [])];
+    let earned = false;
+
+    // Global Milestones
+    if (stats.sessionsCompleted >= 5 && !newBadges.includes('Quick Learner')) {
+      newBadges.push('Quick Learner');
+      earned = true;
+    }
+    if (stats.streak >= 7 && !newBadges.includes('Consistent Scholar')) {
+      newBadges.push('Consistent Scholar');
+      earned = true;
+    }
+    if (stats.xp >= 2500 && !newBadges.includes('XP Pioneer')) {
+      newBadges.push('XP Pioneer');
+      earned = true;
+    }
+
+    // Subject Specific Milestones
+    Object.entries(stats.subjectStats).forEach(([subject, sStats]) => {
+      if (sStats.level >= 5 && !newBadges.includes(`${subject} Expert`)) {
+        newBadges.push(`${subject} Expert`);
+        earned = true;
+      }
+      // Check for high scores
+      if (Object.values(sStats.quizHighScores).some(score => score === 100) && !newBadges.includes(`${subject} Master`)) {
+        newBadges.push(`${subject} Master`);
+        earned = true;
+      }
+    });
+
+    if (earned) {
+      toast.success("Badge Unlocked!", {
+        description: `You've earned a new achievement: ${newBadges[newBadges.length - 1]}`,
+        icon: <Trophy className="w-5 h-5 text-yellow-500" />
+      });
+      updateSettings({ badges: newBadges });
+    }
+  };
 
   // Theme Logic
   useEffect(() => {
@@ -338,7 +440,8 @@ export default function App() {
           const yesterday = new Date(Date.now() - 86400000).toISOString().split('T')[0];
           
           // Global Stats
-          const newXp = userSettings.stats.xp + 50;
+          const xpEarned = Math.floor(sessionDuration * XP_PER_SESSION_MIN);
+          const newXp = userSettings.stats.xp + xpEarned;
           const newSessions = userSettings.stats.sessionsCompleted + 1;
           const newTodayHours = userSettings.stats.todayHours + sessionHours;
           const newWeeklyHours = userSettings.stats.weeklyHours + sessionHours;
@@ -362,25 +465,8 @@ export default function App() {
           }
 
           const streakBonus = newSubjectStreak >= 3 ? 25 : 0;
-          const newSubjectXp = currentSubjectStats.xp + 50 + streakBonus;
-          const newSubjectLevel = Math.floor(newSubjectXp / 100) + 1;
-
-          // Badge logic
-          const newBadges = [...currentSubjectStats.badges];
-          if (newSubjectLevel >= 5 && !newBadges.includes(`${subject} Expert`)) {
-            newBadges.push(`${subject} Expert`);
-            toast.success(`Badge Earned: ${subject} Expert!`, {
-              description: `You've reached level 5 in ${subject}.`,
-              icon: <Trophy className="w-5 h-5 text-yellow-500" />,
-            });
-          }
-          if (newSubjectStreak >= 7 && !newBadges.includes(`${subject} Dedicated`)) {
-            newBadges.push(`${subject} Dedicated`);
-            toast.success(`Badge Earned: ${subject} Dedicated!`, {
-              description: `You've studied ${subject} for 7 days in a row.`,
-              icon: <Trophy className="w-5 h-5 text-yellow-500" />,
-            });
-          }
+          const newSubjectXp = currentSubjectStats.xp + xpEarned + streakBonus;
+          const newSubjectLevel = calculateLevel(newSubjectXp);
 
           const updatedSubjectStats = {
             ...userSettings.stats.subjectStats,
@@ -390,7 +476,6 @@ export default function App() {
               level: newSubjectLevel,
               studyStreak: newSubjectStreak,
               lastStudyDate: today,
-              badges: newBadges,
               quizHighScores: currentSubjectStats.quizHighScores || {}
             }
           };
@@ -406,22 +491,42 @@ export default function App() {
             }
           });
 
-          updateSettings({
-            stats: {
-              ...userSettings.stats,
-              xp: newXp,
-              sessionsCompleted: newSessions,
-              todayHours: newTodayHours,
-              weeklyHours: newWeeklyHours,
-              level: Math.floor(newXp / 100) + 1,
-              subjectStats: updatedSubjectStats,
-              mostStudiedSubject: mostStudied
-            }
-          });
+          const dayOfWeek = new Date().toLocaleDateString('en-US', { weekday: 'short' });
+          let newWeeklyStudyHistory = [...(userSettings.stats.weeklyStudyHistory || DEFAULT_STATS.weeklyStudyHistory)];
+          const dayIndex = newWeeklyStudyHistory.findIndex(h => h.day === dayOfWeek);
+          if (dayIndex > -1) {
+            newWeeklyStudyHistory[dayIndex].hours += sessionHours;
+          }
+
+          let newDailyXpHistory = [...(userSettings.stats.dailyXpHistory || [])];
+          const todayXpIndex = newDailyXpHistory.findIndex(h => h.date === today);
+          if (todayXpIndex > -1) {
+            newDailyXpHistory[todayXpIndex].xp += xpEarned + streakBonus;
+          } else {
+            newDailyXpHistory.push({ date: today, xp: xpEarned + streakBonus });
+          }
+          if (newDailyXpHistory.length > 14) newDailyXpHistory = newDailyXpHistory.slice(-14);
+
+          const newStats = {
+            ...userSettings.stats,
+            xp: newXp,
+            level: calculateLevel(newXp),
+            sessionsCompleted: newSessions,
+            todayHours: newTodayHours,
+            weeklyHours: newWeeklyHours,
+            lastActiveDate: today,
+            subjectStats: updatedSubjectStats,
+            mostStudiedSubject: mostStudied,
+            weeklyStudyHistory: newWeeklyStudyHistory,
+            dailyXpHistory: newDailyXpHistory
+          };
+
+          updateSettings({ stats: newStats });
+          checkMilestones(newStats);
 
           if (userSettings.notificationsEnabled) {
             toast.success("Session completed!", {
-              description: `You've earned 50 XP in ${subject}${streakBonus > 0 ? ` + ${streakBonus} streak bonus!` : ''}`,
+              description: `You've earned ${xpEarned} XP in ${subject}${streakBonus > 0 ? ` + ${streakBonus} streak bonus!` : ''}`,
               icon: <CheckCircle2 className="w-5 h-5 text-emerald-500" />,
             });
 
@@ -673,14 +778,18 @@ export default function App() {
     const newHighScore = Math.max(oldHighScore, finalScore);
     
     // XP for taking quiz
-    const xpEarned = 20 + (score * 10); // 20 base + 10 per correct answer
+    const xpEarned = XP_QUIZ_BASE + (score * XP_QUIZ_CORRECT);
     const newTotalXp = userSettings.stats.xp + xpEarned;
     
+    const newSubjectXp = currentSubjectStats.xp + xpEarned;
+    const newSubjectLevel = calculateLevel(newSubjectXp);
+
     const updatedSubjectStats = {
       ...userSettings.stats.subjectStats,
       [subject]: {
         ...currentSubjectStats,
-        xp: currentSubjectStats.xp + xpEarned,
+        xp: newSubjectXp,
+        level: newSubjectLevel,
         quizHighScores: {
           ...currentSubjectStats.quizHighScores,
           [currentQuiz.difficulty]: newHighScore
@@ -688,15 +797,31 @@ export default function App() {
       }
     };
 
-    updateSettings({
-      stats: {
-        ...userSettings.stats,
-        xp: newTotalXp,
-        totalQuizzesTaken: userSettings.stats.totalQuizzesTaken + 1,
-        averageQuizScore: (userSettings.stats.averageQuizScore * userSettings.stats.totalQuizzesTaken + finalScore) / (userSettings.stats.totalQuizzesTaken + 1),
-        subjectStats: updatedSubjectStats
-      }
-    });
+    const today = new Date().toISOString().split('T')[0];
+    let newQuizScoreHistory = [{ date: today, score: finalScore, subject }, ...(userSettings.stats.quizScoreHistory || [])].slice(0, 10);
+
+    let newDailyXpHistory = [...(userSettings.stats.dailyXpHistory || [])];
+    const todayXpIndex = newDailyXpHistory.findIndex(h => h.date === today);
+    if (todayXpIndex > -1) {
+      newDailyXpHistory[todayXpIndex].xp += xpEarned;
+    } else {
+      newDailyXpHistory.push({ date: today, xp: xpEarned });
+    }
+    if (newDailyXpHistory.length > 14) newDailyXpHistory = newDailyXpHistory.slice(-14);
+
+    const newStats = {
+      ...userSettings.stats,
+      xp: newTotalXp,
+      level: calculateLevel(newTotalXp),
+      totalQuizzesTaken: userSettings.stats.totalQuizzesTaken + 1,
+      averageQuizScore: (userSettings.stats.averageQuizScore * userSettings.stats.totalQuizzesTaken + finalScore) / (userSettings.stats.totalQuizzesTaken + 1),
+      subjectStats: updatedSubjectStats,
+      quizScoreHistory: newQuizScoreHistory,
+      dailyXpHistory: newDailyXpHistory
+    };
+
+    updateSettings({ stats: newStats });
+    checkMilestones(newStats);
 
     toast.success(`Quiz Finished! Score: ${finalScore}%`, {
       description: `You earned ${xpEarned} XP!`,
@@ -728,13 +853,43 @@ export default function App() {
       setIsSummarizerModalOpen(true);
       
       // Award some XP for summarizing
-      const xpEarned = 15;
-      updateSettings({
-        stats: {
-          ...userSettings.stats,
-          xp: userSettings.stats.xp + xpEarned
+      const xpEarned = XP_SUMMARY;
+      const newTotalXp = userSettings.stats.xp + xpEarned;
+      
+      const currentSubjectStats = userSettings.stats.subjectStats[selectedSubject] || {
+        xp: 0, level: 1, badges: [], studyStreak: 0, lastStudyDate: '', quizHighScores: {}
+      };
+      
+      const newSubjectXp = currentSubjectStats.xp + xpEarned;
+      const updatedSubjectStats = {
+        ...userSettings.stats.subjectStats,
+        [selectedSubject]: {
+          ...currentSubjectStats,
+          xp: newSubjectXp,
+          level: calculateLevel(newSubjectXp)
         }
-      });
+      };
+
+      const today = new Date().toISOString().split('T')[0];
+      let newDailyXpHistory = [...(userSettings.stats.dailyXpHistory || [])];
+      const todayXpIndex = newDailyXpHistory.findIndex(h => h.date === today);
+      if (todayXpIndex > -1) {
+        newDailyXpHistory[todayXpIndex].xp += xpEarned;
+      } else {
+        newDailyXpHistory.push({ date: today, xp: xpEarned });
+      }
+      if (newDailyXpHistory.length > 14) newDailyXpHistory = newDailyXpHistory.slice(-14);
+
+      const newStats = {
+        ...userSettings.stats,
+        xp: newTotalXp,
+        level: calculateLevel(newTotalXp),
+        subjectStats: updatedSubjectStats,
+        dailyXpHistory: newDailyXpHistory
+      };
+
+      updateSettings({ stats: newStats });
+      checkMilestones(newStats);
       
       toast.success("Summary generated!", {
         description: `You earned ${xpEarned} XP!`,
@@ -747,6 +902,101 @@ export default function App() {
       setIsGeneratingSummary(false);
     }
   };
+
+  const generateWeeklyPlan = async () => {
+    if (!user) return;
+    setIsGeneratingPlan(true);
+    try {
+      const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY! });
+      const response = await ai.models.generateContent({
+        model: "gemini-3-flash-preview",
+        config: {
+          responseMimeType: "application/json",
+          responseSchema: {
+            type: Type.OBJECT,
+            properties: {
+              plan: {
+                type: Type.ARRAY,
+                items: {
+                  type: Type.OBJECT,
+                  properties: {
+                    day: { type: Type.STRING },
+                    focus: { type: Type.STRING },
+                    tasks: { type: Type.ARRAY, items: { type: Type.STRING } }
+                  },
+                  required: ["day", "focus", "tasks"]
+                }
+              }
+            },
+            required: ["plan"]
+          }
+        },
+        contents: `Generate a personalized weekly study plan for a student with the following profile:
+        - Subjects: ${userSettings.subjects.join(', ')}
+        - Daily Study Goal: ${userSettings.dailyGoal} hours
+        - Preferred Study Method: ${userSettings.studyMethod}
+        - Current Progress: ${Object.entries(userSettings.stats.subjectStats).map(([s, stats]) => `${s}: Level ${stats.level}`).join(', ')}
+        
+        The plan should be realistic, balanced, and cover all subjects while prioritizing those with lower levels. 
+        Provide exactly 7 days (Monday to Sunday).`
+      });
+
+      const data = JSON.parse(response.text);
+      updateSettings({ weeklyStudyPlan: data.plan });
+      toast.success("Weekly Study Plan Generated!", {
+        description: "Your personalized plan is ready in the dashboard.",
+        icon: <Target className="w-5 h-5 text-indigo-500" />,
+      });
+    } catch (err) {
+      console.error("Plan generation error:", err);
+      toast.error("Failed to generate study plan. Please try again.");
+    } finally {
+      setIsGeneratingPlan(false);
+    }
+  };
+
+  const startFlashcardStudy = () => {
+    if (!summaryResult || summaryType !== 'Flashcards') return;
+
+    // Parse Flashcards from summaryResult
+    // Expected format: Q: [Question] \n A: [Answer]
+    const cards: Flashcard[] = [];
+    const lines = summaryResult.split('\n');
+    let currentQ = '';
+    let currentA = '';
+
+    lines.forEach(line => {
+      const trimmed = line.trim();
+      if (trimmed.startsWith('Q:') || trimmed.startsWith('Question:')) {
+        if (currentQ && currentA) {
+          cards.push({ question: currentQ, answer: currentA });
+        }
+        currentQ = trimmed.replace(/^(Q:|Question:)\s*/, '');
+        currentA = '';
+      } else if (trimmed.startsWith('A:') || trimmed.startsWith('Answer:')) {
+        currentA = trimmed.replace(/^(A:|Answer:)\s*/, '');
+      } else if (trimmed && currentQ && !currentA) {
+        currentQ += ' ' + trimmed;
+      } else if (trimmed && currentA) {
+        currentA += ' ' + trimmed;
+      }
+    });
+
+    if (currentQ && currentA) {
+      cards.push({ question: currentQ, answer: currentA });
+    }
+
+    if (cards.length > 0) {
+      setFlashcards(cards);
+      setCurrentFlashcardIndex(0);
+      setIsFlashcardFlipped(false);
+      setIsFlashcardStudyOpen(true);
+      setIsSummarizerModalOpen(false);
+    } else {
+      toast.error("Could not parse flashcards. Please try again.");
+    }
+  };
+
   const formatTime = (seconds: number) => {
     const mins = Math.floor(seconds / 60);
     const secs = seconds % 60;
@@ -1290,6 +1540,27 @@ export default function App() {
             </div>
           </div>
         </div>
+
+        {/* Navigation Links (Website Mode) */}
+        {!user && (
+          <nav className="hidden lg:flex items-center gap-8">
+            <button 
+              onClick={() => document.getElementById('features')?.scrollIntoView({ behavior: 'smooth' })}
+              className="text-sm font-medium text-zinc-500 hover:text-white transition-colors"
+            >
+              Features
+            </button>
+            <button 
+              onClick={() => window.scrollTo({ top: 0, behavior: 'smooth' })}
+              className="text-sm font-medium text-zinc-500 hover:text-white transition-colors"
+            >
+              How it Works
+            </button>
+            <a href="#" className="text-sm font-medium text-zinc-500 hover:text-white transition-colors">Pricing</a>
+            <a href="#" className="text-sm font-medium text-zinc-500 hover:text-white transition-colors">About</a>
+          </nav>
+        )}
+
         <div className="flex items-center gap-4">
           {isTimerActive && (
             <motion.div 
@@ -1430,45 +1701,284 @@ export default function App() {
              style={{ backgroundImage: 'radial-gradient(circle at 1px 1px, #4f46e5 1px, transparent 0)', backgroundSize: '40px 40px' }} />
         
         {!user ? (
-          <div className="h-full flex flex-col items-center justify-center text-center space-y-8 max-w-2xl mx-auto relative z-10">
-            <motion.div 
-              initial={{ opacity: 0, scale: 0.9 }}
-              animate={{ opacity: 1, scale: 1 }}
-              className="w-24 h-24 rounded-[2.5rem] bg-zinc-900 border border-zinc-800 flex items-center justify-center mb-4 shadow-2xl shadow-indigo-500/20 relative"
-            >
-              <LogIn className="w-12 h-12 text-indigo-400 relative z-10" />
-            </motion.div>
-            <div className="space-y-4">
-              <h2 className="text-4xl font-serif italic font-bold text-white tracking-tight">Sign in to start learning.</h2>
-              <p className="text-zinc-500 text-xl font-light leading-relaxed max-w-lg mx-auto">
-                Connect your account to save your study sessions and access personalized tutoring.
-              </p>
-              <div className="flex flex-col sm:flex-row items-center justify-center gap-4 mt-8">
-                <button 
-                  onClick={handleGoogleLogin}
-                  className="w-full sm:w-auto px-8 py-4 bg-white text-zinc-950 rounded-2xl text-lg font-bold transition-all shadow-xl shadow-white/10 flex items-center justify-center gap-3 hover:scale-105"
-                >
-                  <img src="https://www.gstatic.com/firebasejs/ui/2.0.0/images/auth/google.svg" alt="Google" className="w-6 h-6" />
-                  Continue with Google
-                </button>
-                <div className="flex items-center gap-4 w-full sm:w-auto">
+          <div className="relative z-10 w-full">
+            {/* Hero Section */}
+            <section className="min-h-[90vh] flex flex-col items-center justify-center text-center px-4 py-20 relative overflow-hidden">
+              <div className="absolute inset-0 pointer-events-none">
+                <div className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 w-[800px] h-[800px] bg-indigo-600/10 blur-[120px] rounded-full animate-pulse" />
+              </div>
+              
+              <motion.div
+                initial={{ opacity: 0, y: 30 }}
+                animate={{ opacity: 1, y: 0 }}
+                transition={{ duration: 0.8 }}
+                className="max-w-4xl mx-auto space-y-8"
+              >
+                <div className="inline-flex items-center gap-2 px-4 py-2 rounded-full bg-indigo-500/10 border border-indigo-500/20 text-indigo-400 text-xs font-bold uppercase tracking-widest mb-4">
+                  <Zap className="w-3 h-3" />
+                  The Future of Academic Excellence
+                </div>
+                
+                <h1 className="text-6xl md:text-8xl font-serif italic font-bold text-white tracking-tight leading-[1.1]">
+                  Master Any Subject <br />
+                  <span className="text-transparent bg-clip-text bg-gradient-to-r from-indigo-400 via-violet-400 to-amber-400">
+                    With AI Precision.
+                  </span>
+                </h1>
+                
+                <p className="text-zinc-400 text-xl md:text-2xl font-light leading-relaxed max-w-2xl mx-auto">
+                  Study Focus is your personal AI tutor and productivity lab. 
+                  Deep focus sessions, instant topic mastery, and intelligent progress tracking.
+                </p>
+
+                <div className="flex flex-col sm:flex-row items-center justify-center gap-6 pt-8">
                   <button 
-                    onClick={() => handleLogin('signin')}
-                    className="flex-1 sm:flex-none px-6 py-4 bg-zinc-900 border border-zinc-800 hover:bg-zinc-800 text-white rounded-2xl text-sm font-semibold transition-all shadow-xl flex items-center justify-center gap-2"
+                    onClick={handleGoogleLogin}
+                    className="w-full sm:w-auto px-10 py-5 bg-white text-zinc-950 rounded-2xl text-lg font-bold transition-all shadow-2xl shadow-white/10 flex items-center justify-center gap-3 hover:scale-105 active:scale-95"
                   >
-                    <LogIn className="w-5 h-5" />
-                    Sign In
+                    <img src="https://www.gstatic.com/firebasejs/ui/2.0.0/images/auth/google.svg" alt="Google" className="w-6 h-6" />
+                    Get Started Free
                   </button>
                   <button 
-                    onClick={() => handleLogin('signup')}
-                    className="flex-1 sm:flex-none px-6 py-4 bg-zinc-900 border border-zinc-800 hover:bg-zinc-800 text-white rounded-2xl text-sm font-semibold transition-all shadow-xl flex items-center justify-center gap-2"
+                    onClick={() => {
+                      const features = document.getElementById('features');
+                      features?.scrollIntoView({ behavior: 'smooth' });
+                    }}
+                    className="w-full sm:w-auto px-10 py-5 bg-zinc-900 border border-zinc-800 hover:bg-zinc-800 text-white rounded-2xl text-lg font-bold transition-all flex items-center justify-center gap-3"
                   >
-                    <User className="w-5 h-5" />
-                    Join Free
+                    <Play className="w-5 h-5 text-indigo-400" />
+                    Watch Demo
                   </button>
                 </div>
+
+                <div className="pt-12 flex items-center justify-center gap-8 text-zinc-500">
+                  <div className="flex items-center gap-2">
+                    <Users className="w-5 h-5" />
+                    <span className="text-sm font-medium">10,000+ Students</span>
+                  </div>
+                  <div className="flex items-center gap-2">
+                    <Star className="w-5 h-5 text-amber-500" />
+                    <span className="text-sm font-medium">4.9/5 Rating</span>
+                  </div>
+                </div>
+              </motion.div>
+
+              {/* Floating Elements */}
+              <motion.div 
+                animate={{ y: [0, -20, 0] }}
+                transition={{ duration: 4, repeat: Infinity, ease: "easeInOut" }}
+                className="absolute top-1/4 right-[10%] hidden xl:block p-6 bg-zinc-900/80 border border-zinc-800 backdrop-blur-xl rounded-[2rem] shadow-2xl"
+              >
+                <div className="flex items-center gap-4 mb-4">
+                  <div className="w-10 h-10 rounded-xl bg-emerald-500/20 flex items-center justify-center">
+                    <Target className="w-5 h-5 text-emerald-400" />
+                  </div>
+                  <div className="text-left">
+                    <p className="text-[10px] font-bold text-zinc-500 uppercase tracking-widest">Current Session</p>
+                    <p className="text-sm font-serif italic text-white">Quantum Mechanics</p>
+                  </div>
+                </div>
+                <div className="w-48 h-2 bg-zinc-800 rounded-full overflow-hidden">
+                  <div className="h-full bg-emerald-500 w-[75%]" />
+                </div>
+              </motion.div>
+
+              <motion.div 
+                animate={{ y: [0, 20, 0] }}
+                transition={{ duration: 5, repeat: Infinity, ease: "easeInOut", delay: 1 }}
+                className="absolute bottom-1/4 left-[10%] hidden xl:block p-6 bg-zinc-900/80 border border-zinc-800 backdrop-blur-xl rounded-[2rem] shadow-2xl"
+              >
+                <div className="flex items-center gap-4 mb-4">
+                  <div className="w-10 h-10 rounded-xl bg-indigo-500/20 flex items-center justify-center">
+                    <Brain className="w-5 h-5 text-indigo-400" />
+                  </div>
+                  <div className="text-left">
+                    <p className="text-[10px] font-bold text-zinc-500 uppercase tracking-widest">AI Tutor</p>
+                    <p className="text-sm font-serif italic text-white">"Let's solve this step-by-step."</p>
+                  </div>
+                </div>
+              </motion.div>
+            </section>
+
+            {/* Features Section */}
+            <section id="features" className="py-32 px-4 bg-zinc-950/50">
+              <div className="max-w-7xl mx-auto space-y-20">
+                <div className="text-center space-y-4 max-w-3xl mx-auto">
+                  <h2 className="text-4xl md:text-6xl font-serif italic font-bold text-white">Engineered for Deep Learning.</h2>
+                  <p className="text-zinc-500 text-lg">We've combined cognitive science with advanced AI to create the ultimate study environment.</p>
+                </div>
+
+                <div className="grid grid-cols-1 md:grid-cols-3 gap-8">
+                  {[
+                    {
+                      icon: <Brain className="w-8 h-8 text-indigo-400" />,
+                      title: "AI Personal Tutor",
+                      desc: "Get instant explanations, step-by-step solutions, and personalized study plans tailored to your learning style."
+                    },
+                    {
+                      icon: <Target className="w-8 h-8 text-emerald-400" />,
+                      title: "Smart Focus Timer",
+                      desc: "Optimized Pomodoro and Deep Study modes with AI-generated check-ins to ensure you're actually learning."
+                    },
+                    {
+                      icon: <Zap className="w-8 h-8 text-amber-400" />,
+                      title: "Instant Topic Mastery",
+                      desc: "Enter any subject and let AI generate a structured curriculum of high-value topics for you to master."
+                    },
+                    {
+                      icon: <FileText className="w-8 h-8 text-violet-400" />,
+                      title: "Smart Summarizer",
+                      desc: "Upload your notes or textbooks and get instant bullet points, key concepts, or flashcards."
+                    },
+                    {
+                      icon: <Trophy className="w-8 h-8 text-yellow-400" />,
+                      title: "Gamified Progress",
+                      desc: "Earn XP, level up in specific subjects, and unlock badges as you build a consistent study habit."
+                    },
+                    {
+                      icon: <Shield className="w-8 h-8 text-blue-400" />,
+                      title: "Distraction Shield",
+                      desc: "A dedicated study environment that keeps you focused on your goals and away from distractions."
+                    }
+                  ].map((feature, i) => (
+                    <motion.div
+                      key={i}
+                      whileHover={{ y: -10 }}
+                      className="p-10 bg-zinc-900/50 border border-zinc-800 rounded-[2.5rem] space-y-6 hover:bg-zinc-900 transition-all group"
+                    >
+                      <div className="w-16 h-16 rounded-2xl bg-zinc-950 border border-zinc-800 flex items-center justify-center group-hover:scale-110 transition-transform">
+                        {feature.icon}
+                      </div>
+                      <h3 className="text-2xl font-serif italic font-bold text-white">{feature.title}</h3>
+                      <p className="text-zinc-500 leading-relaxed">{feature.desc}</p>
+                    </motion.div>
+                  ))}
+                </div>
               </div>
-            </div>
+            </section>
+
+            {/* How it Works */}
+            <section className="py-32 px-4">
+              <div className="max-w-7xl mx-auto">
+                <div className="grid grid-cols-1 lg:grid-cols-2 gap-20 items-center">
+                  <div className="space-y-12">
+                    <h2 className="text-4xl md:text-6xl font-serif italic font-bold text-white leading-tight">
+                      Your Journey to <br />
+                      Academic Mastery.
+                    </h2>
+                    
+                    <div className="space-y-8">
+                      {[
+                        { step: "01", title: "Connect Your Account", desc: "Sign in with Google to sync your progress across all devices." },
+                        { step: "02", title: "Define Your Focus", desc: "Choose a subject or let AI suggest high-value topics for your session." },
+                        { step: "03", title: "Enter Deep Focus", desc: "Start a timed session and use the AI Tutor for quick lookups." },
+                        { step: "04", title: "Track & Level Up", desc: "Complete sessions, earn XP, and watch your subject mastery grow." }
+                      ].map((item, i) => (
+                        <div key={i} className="flex gap-6 group">
+                          <span className="text-4xl font-serif italic font-bold text-indigo-500/20 group-hover:text-indigo-500 transition-colors">{item.step}</span>
+                          <div className="space-y-2">
+                            <h4 className="text-xl font-bold text-white">{item.title}</h4>
+                            <p className="text-zinc-500">{item.desc}</p>
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                  
+                  <div className="relative">
+                    <div className="absolute -inset-4 bg-gradient-to-r from-indigo-500 to-violet-500 rounded-[3rem] blur-2xl opacity-20" />
+                    <div className="relative bg-zinc-900 border border-zinc-800 rounded-[3rem] overflow-hidden shadow-2xl">
+                      <img 
+                        src="https://images.unsplash.com/photo-1434030216411-0b793f4b4173?auto=format&fit=crop&q=80&w=1000" 
+                        alt="Study Environment" 
+                        className="w-full h-[600px] object-cover opacity-60 grayscale hover:grayscale-0 transition-all duration-700"
+                        referrerPolicy="no-referrer"
+                      />
+                      <div className="absolute inset-0 bg-gradient-to-t from-zinc-950 via-transparent to-transparent" />
+                      <div className="absolute bottom-10 left-10 right-10 p-8 bg-zinc-900/80 border border-zinc-800 backdrop-blur-xl rounded-3xl">
+                        <p className="text-white font-serif italic text-xl mb-2">"This app completely changed how I prepare for exams. The AI tutor is like having a professor on call 24/7."</p>
+                        <p className="text-zinc-500 text-sm font-bold uppercase tracking-widest">— Sarah J., Medical Student</p>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </section>
+
+            {/* CTA Section */}
+            <section className="py-32 px-4">
+              <div className="max-w-5xl mx-auto bg-gradient-to-br from-indigo-600 to-violet-700 rounded-[3rem] p-12 md:p-20 text-center space-y-10 relative overflow-hidden shadow-2xl">
+                <div className="absolute top-0 right-0 w-64 h-64 bg-white/10 blur-[80px] rounded-full -translate-y-1/2 translate-x-1/2" />
+                <div className="relative z-10 space-y-6">
+                  <h2 className="text-4xl md:text-6xl font-serif italic font-bold text-white">Ready to elevate your learning?</h2>
+                  <p className="text-indigo-100 text-xl max-w-2xl mx-auto">Join thousands of students who are already studying smarter, not harder.</p>
+                  <div className="pt-6">
+                    <button 
+                      onClick={handleGoogleLogin}
+                      className="px-12 py-6 bg-white text-indigo-600 rounded-2xl text-xl font-bold transition-all shadow-2xl hover:scale-105 active:scale-95 flex items-center justify-center gap-3 mx-auto"
+                    >
+                      Start Your First Session
+                      <ArrowRight className="w-6 h-6" />
+                    </button>
+                  </div>
+                </div>
+              </div>
+            </section>
+
+            {/* Footer */}
+            <footer className="py-20 px-4 border-t border-zinc-900">
+              <div className="max-w-7xl mx-auto grid grid-cols-1 md:grid-cols-4 gap-12">
+                <div className="space-y-6">
+                  <div className="flex items-center gap-3">
+                    <div className="w-10 h-10 rounded-2xl bg-indigo-600 flex items-center justify-center shadow-lg shadow-indigo-500/20">
+                      <GraduationCap className="w-6 h-6 text-white" />
+                    </div>
+                    <span className="text-xl font-serif italic font-bold text-white tracking-tighter">Study Focus</span>
+                  </div>
+                  <p className="text-zinc-500 text-sm leading-relaxed">
+                    The ultimate AI-powered study environment for modern students. 
+                    Built with passion for academic excellence.
+                  </p>
+                </div>
+                
+                <div>
+                  <h4 className="text-white font-bold mb-6">Product</h4>
+                  <ul className="space-y-4 text-sm text-zinc-500">
+                    <li><a href="#" className="hover:text-indigo-400 transition-colors">Features</a></li>
+                    <li><a href="#" className="hover:text-indigo-400 transition-colors">AI Tutor</a></li>
+                    <li><a href="#" className="hover:text-indigo-400 transition-colors">Pricing</a></li>
+                    <li><a href="#" className="hover:text-indigo-400 transition-colors">Updates</a></li>
+                  </ul>
+                </div>
+
+                <div>
+                  <h4 className="text-white font-bold mb-6">Company</h4>
+                  <ul className="space-y-4 text-sm text-zinc-500">
+                    <li><a href="#" className="hover:text-indigo-400 transition-colors">About Us</a></li>
+                    <li><a href="#" className="hover:text-indigo-400 transition-colors">Careers</a></li>
+                    <li><a href="#" className="hover:text-indigo-400 transition-colors">Privacy</a></li>
+                    <li><a href="#" className="hover:text-indigo-400 transition-colors">Terms</a></li>
+                  </ul>
+                </div>
+
+                <div>
+                  <h4 className="text-white font-bold mb-6">Connect</h4>
+                  <ul className="space-y-4 text-sm text-zinc-500">
+                    <li><a href="#" className="hover:text-indigo-400 transition-colors">Twitter</a></li>
+                    <li><a href="#" className="hover:text-indigo-400 transition-colors">Discord</a></li>
+                    <li><a href="#" className="hover:text-indigo-400 transition-colors">Instagram</a></li>
+                    <li><a href="#" className="hover:text-indigo-400 transition-colors">Support</a></li>
+                  </ul>
+                </div>
+              </div>
+              <div className="max-w-7xl mx-auto pt-20 flex flex-col md:flex-row items-center justify-between gap-6 border-t border-zinc-900 mt-20">
+                <p className="text-zinc-600 text-xs">© 2026 Study Focus AI. All rights reserved.</p>
+                <div className="flex items-center gap-6">
+                  <Globe className="w-4 h-4 text-zinc-600" />
+                  <span className="text-zinc-600 text-xs">English (US)</span>
+                </div>
+              </div>
+            </footer>
           </div>
         ) : messages.length === 0 ? (
           <div className="max-w-5xl mx-auto w-full space-y-8 py-4 px-2">
@@ -1507,11 +2017,40 @@ export default function App() {
                   <p className="text-xs font-bold text-zinc-500 uppercase tracking-widest">Current Level</p>
                   <p className="text-lg font-serif italic text-white">Level {userSettings.stats.level}</p>
                   <div className="mt-1 h-1 w-24 bg-zinc-800 rounded-full overflow-hidden">
-                    <div className="h-full bg-violet-500 rounded-full" style={{ width: `${(userSettings.stats.xp % 100)}%` }} />
+                    <div className="h-full bg-violet-500 rounded-full transition-all duration-1000" style={{ width: `${(userSettings.stats.xp % XP_PER_LEVEL) / XP_PER_LEVEL * 100}%` }} />
                   </div>
                 </div>
               </motion.div>
             </div>
+
+            {/* Badges Section */}
+            {userSettings.badges && userSettings.badges.length > 0 && (
+              <div className="space-y-4">
+                <div className="flex items-center justify-between">
+                  <h3 className="text-xs font-bold text-zinc-500 uppercase tracking-[0.3em]">Achievements & Badges</h3>
+                  <span className="text-[10px] text-indigo-400 font-bold uppercase tracking-widest">{userSettings.badges.length} Unlocked</span>
+                </div>
+                <div className="flex flex-wrap gap-3">
+                  {userSettings.badges.map((badge, i) => (
+                    <motion.div 
+                      key={i}
+                      initial={{ opacity: 0, scale: 0.8 }}
+                      animate={{ opacity: 1, scale: 1 }}
+                      transition={{ delay: i * 0.1 }}
+                      className="group relative"
+                    >
+                      <div className="px-4 py-2 bg-zinc-900/50 border border-zinc-800/50 rounded-xl flex items-center gap-2 hover:bg-zinc-800 transition-colors cursor-default">
+                        <Trophy className="w-3 h-3 text-yellow-500" />
+                        <span className="text-[10px] font-bold text-zinc-300 uppercase tracking-widest">{badge}</span>
+                      </div>
+                      <div className="absolute bottom-full left-1/2 -translate-x-1/2 mb-2 px-3 py-1 bg-zinc-800 text-white text-[8px] font-bold uppercase tracking-widest rounded opacity-0 group-hover:opacity-100 transition-opacity pointer-events-none whitespace-nowrap z-50">
+                        Achievement Unlocked
+                      </div>
+                    </motion.div>
+                  ))}
+                </div>
+              </div>
+            )}
 
             {/* Stats Grid */}
             <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
@@ -1580,6 +2119,259 @@ export default function App() {
                   <p className="text-[10px] text-zinc-500 uppercase tracking-widest mt-1">Total experience</p>
                 </div>
               </div>
+            </div>
+
+            {/* Subject Mastery Section */}
+            <div className="space-y-4">
+              <div className="flex items-center justify-between">
+                <h3 className="text-xs font-bold text-zinc-500 uppercase tracking-[0.3em]">Subject Mastery</h3>
+                <span className="text-[10px] text-indigo-400 font-bold uppercase tracking-widest">Track your progress</span>
+              </div>
+              <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
+                {Object.entries(userSettings.stats.subjectStats).map(([subject, stats]) => (
+                  <div key={subject} className={`${userSettings.theme === 'dark' ? 'bg-zinc-900/40 border-zinc-800/50' : 'bg-white border-zinc-200'} border p-5 rounded-3xl space-y-4 transition-all hover:scale-[1.02]`}>
+                    <div className="flex items-center justify-between">
+                      <div className="flex items-center gap-3">
+                        <div className="w-8 h-8 rounded-xl bg-indigo-500/10 flex items-center justify-center">
+                          <Brain className="w-4 h-4 text-indigo-500" />
+                        </div>
+                        <span className={`text-sm font-bold ${userSettings.theme === 'dark' ? 'text-white' : 'text-zinc-900'}`}>{subject}</span>
+                      </div>
+                      <span className="px-2 py-1 bg-zinc-800 rounded-lg text-[10px] font-bold text-zinc-400 uppercase tracking-widest">Lvl {stats.level}</span>
+                    </div>
+                    <div className="space-y-2">
+                      <div className="flex items-center justify-between text-[10px] font-bold uppercase tracking-widest">
+                        <span className="text-zinc-500">Progress</span>
+                        <span className="text-indigo-400">{stats.xp % XP_PER_LEVEL} / {XP_PER_LEVEL} XP</span>
+                      </div>
+                      <div className="h-1.5 w-full bg-zinc-800 rounded-full overflow-hidden">
+                        <div 
+                          className="h-full bg-indigo-500 rounded-full transition-all duration-1000" 
+                          style={{ width: `${(stats.xp % XP_PER_LEVEL) / XP_PER_LEVEL * 100}%` }} 
+                        />
+                      </div>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </div>
+
+            {/* Progress Analytics Section */}
+            <div className="space-y-6">
+              <div className="flex items-center justify-between">
+                <h3 className="text-xs font-bold text-zinc-500 uppercase tracking-[0.3em]">Progress Analytics</h3>
+                <span className="text-[10px] text-indigo-400 font-bold uppercase tracking-widest">Deep insights</span>
+              </div>
+              
+              <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+                {/* Weekly Study Hours */}
+                <div className={`${userSettings.theme === 'dark' ? 'bg-zinc-900/40 border-zinc-800/50' : 'bg-white border-zinc-200'} border p-6 rounded-[2.5rem] space-y-6`}>
+                  <div className="flex items-center justify-between">
+                    <div>
+                      <h4 className={`text-lg font-serif italic font-bold ${userSettings.theme === 'dark' ? 'text-white' : 'text-zinc-900'}`}>Study Consistency</h4>
+                      <p className="text-[10px] text-zinc-500 font-bold uppercase tracking-widest">Hours per day this week</p>
+                    </div>
+                    <div className="w-10 h-10 rounded-xl bg-emerald-500/10 flex items-center justify-center">
+                      <Clock className="w-5 h-5 text-emerald-500" />
+                    </div>
+                  </div>
+                  <div className="h-[200px] w-full">
+                    <ResponsiveContainer width="100%" height="100%">
+                      <BarChart data={userSettings.stats.weeklyStudyHistory || DEFAULT_STATS.weeklyStudyHistory}>
+                        <CartesianGrid strokeDasharray="3 3" stroke={userSettings.theme === 'dark' ? '#18181b' : '#f4f4f5'} vertical={false} />
+                        <XAxis 
+                          dataKey="day" 
+                          axisLine={false} 
+                          tickLine={false} 
+                          tick={{ fill: '#71717a', fontSize: 10, fontWeight: 600 }} 
+                          dy={10}
+                        />
+                        <YAxis hide />
+                        <Tooltip 
+                          cursor={{ fill: userSettings.theme === 'dark' ? '#27272a' : '#f4f4f5', radius: 8 }}
+                          contentStyle={{ 
+                            backgroundColor: userSettings.theme === 'dark' ? '#09090b' : '#ffffff', 
+                            border: `1px solid ${userSettings.theme === 'dark' ? '#27272a' : '#e4e4e7'}`,
+                            borderRadius: '12px',
+                            fontSize: '10px',
+                            fontWeight: 'bold',
+                            textTransform: 'uppercase'
+                          }}
+                        />
+                        <Bar 
+                          dataKey="hours" 
+                          fill="#10b981" 
+                          radius={[6, 6, 6, 6]} 
+                          barSize={30}
+                        />
+                      </BarChart>
+                    </ResponsiveContainer>
+                  </div>
+                </div>
+
+                {/* XP Gain Over Time */}
+                <div className={`${userSettings.theme === 'dark' ? 'bg-zinc-900/40 border-zinc-800/50' : 'bg-white border-zinc-200'} border p-6 rounded-[2.5rem] space-y-6`}>
+                  <div className="flex items-center justify-between">
+                    <div>
+                      <h4 className={`text-lg font-serif italic font-bold ${userSettings.theme === 'dark' ? 'text-white' : 'text-zinc-900'}`}>XP Momentum</h4>
+                      <p className="text-[10px] text-zinc-500 font-bold uppercase tracking-widest">Growth over the last 14 days</p>
+                    </div>
+                    <div className="w-10 h-10 rounded-xl bg-violet-500/10 flex items-center justify-center">
+                      <Zap className="w-5 h-5 text-violet-500" />
+                    </div>
+                  </div>
+                  <div className="h-[200px] w-full">
+                    <ResponsiveContainer width="100%" height="100%">
+                      <AreaChart data={userSettings.stats.dailyXpHistory || []}>
+                        <defs>
+                          <linearGradient id="colorXp" x1="0" y1="0" x2="0" y2="1">
+                            <stop offset="5%" stopColor="#8b5cf6" stopOpacity={0.3}/>
+                            <stop offset="95%" stopColor="#8b5cf6" stopOpacity={0}/>
+                          </linearGradient>
+                        </defs>
+                        <CartesianGrid strokeDasharray="3 3" stroke={userSettings.theme === 'dark' ? '#18181b' : '#f4f4f5'} vertical={false} />
+                        <XAxis 
+                          dataKey="date" 
+                          axisLine={false} 
+                          tickLine={false} 
+                          tick={{ fill: '#71717a', fontSize: 8, fontWeight: 600 }} 
+                          tickFormatter={(str) => str.split('-').slice(1).join('/')}
+                          dy={10}
+                        />
+                        <YAxis hide />
+                        <Tooltip 
+                          contentStyle={{ 
+                            backgroundColor: userSettings.theme === 'dark' ? '#09090b' : '#ffffff', 
+                            border: `1px solid ${userSettings.theme === 'dark' ? '#27272a' : '#e4e4e7'}`,
+                            borderRadius: '12px',
+                            fontSize: '10px',
+                            fontWeight: 'bold'
+                          }}
+                        />
+                        <Area 
+                          type="monotone" 
+                          dataKey="xp" 
+                          stroke="#8b5cf6" 
+                          strokeWidth={3}
+                          fillOpacity={1} 
+                          fill="url(#colorXp)" 
+                        />
+                      </AreaChart>
+                    </ResponsiveContainer>
+                  </div>
+                </div>
+
+                {/* Quiz Score Trends */}
+                <div className={`${userSettings.theme === 'dark' ? 'bg-zinc-900/40 border-zinc-800/50' : 'bg-white border-zinc-200'} border p-6 rounded-[2.5rem] lg:col-span-2 space-y-6`}>
+                  <div className="flex items-center justify-between">
+                    <div>
+                      <h4 className={`text-lg font-serif italic font-bold ${userSettings.theme === 'dark' ? 'text-white' : 'text-zinc-900'}`}>Academic Excellence</h4>
+                      <p className="text-[10px] text-zinc-500 font-bold uppercase tracking-widest">Recent quiz performance trends</p>
+                    </div>
+                    <div className="w-10 h-10 rounded-xl bg-indigo-500/10 flex items-center justify-center">
+                      <Trophy className="w-5 h-5 text-indigo-500" />
+                    </div>
+                  </div>
+                  <div className="h-[250px] w-full">
+                    <ResponsiveContainer width="100%" height="100%">
+                      <LineChart data={[...(userSettings.stats.quizScoreHistory || [])].reverse()}>
+                        <CartesianGrid strokeDasharray="3 3" stroke={userSettings.theme === 'dark' ? '#18181b' : '#f4f4f5'} vertical={false} />
+                        <XAxis 
+                          dataKey="date" 
+                          axisLine={false} 
+                          tickLine={false} 
+                          tick={{ fill: '#71717a', fontSize: 8, fontWeight: 600 }} 
+                          tickFormatter={(str) => str.split('-').slice(1).join('/')}
+                          dy={10}
+                        />
+                        <YAxis 
+                          domain={[0, 100]} 
+                          axisLine={false} 
+                          tickLine={false} 
+                          tick={{ fill: '#71717a', fontSize: 10, fontWeight: 600 }} 
+                        />
+                        <Tooltip 
+                          contentStyle={{ 
+                            backgroundColor: userSettings.theme === 'dark' ? '#09090b' : '#ffffff', 
+                            border: `1px solid ${userSettings.theme === 'dark' ? '#27272a' : '#e4e4e7'}`,
+                            borderRadius: '12px',
+                            fontSize: '10px',
+                            fontWeight: 'bold'
+                          }}
+                        />
+                        <Line 
+                          type="monotone" 
+                          dataKey="score" 
+                          stroke="#6366f1" 
+                          strokeWidth={4}
+                          dot={{ r: 6, fill: '#6366f1', strokeWidth: 2, stroke: userSettings.theme === 'dark' ? '#09090b' : '#ffffff' }}
+                          activeDot={{ r: 8, strokeWidth: 0 }}
+                        />
+                      </LineChart>
+                    </ResponsiveContainer>
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            {/* Smart Study Plan Section */}
+            <div className="space-y-6">
+              <div className="flex items-center justify-between">
+                <h3 className="text-xs font-bold text-zinc-500 uppercase tracking-[0.3em]">Smart Study Plan</h3>
+                <button 
+                  onClick={generateWeeklyPlan}
+                  disabled={isGeneratingPlan}
+                  className="flex items-center gap-2 text-[10px] text-indigo-400 font-bold uppercase tracking-widest hover:text-indigo-300 transition-colors disabled:text-zinc-600"
+                >
+                  {isGeneratingPlan ? <Loader2 className="w-3 h-3 animate-spin" /> : <Sparkles className="w-3 h-3" />}
+                  {userSettings.weeklyStudyPlan ? 'Regenerate Plan' : 'Generate Plan'}
+                </button>
+              </div>
+
+              {!userSettings.weeklyStudyPlan ? (
+                <div className={`${userSettings.theme === 'dark' ? 'bg-zinc-900/40 border-zinc-800/50' : 'bg-white border-zinc-200'} border p-12 rounded-[2.5rem] text-center space-y-6`}>
+                  <div className="w-16 h-16 rounded-2xl bg-indigo-500/10 flex items-center justify-center mx-auto">
+                    <Target className="w-8 h-8 text-indigo-500" />
+                  </div>
+                  <div className="space-y-2">
+                    <h4 className={`text-xl font-serif italic font-bold ${userSettings.theme === 'dark' ? 'text-white' : 'text-zinc-900'}`}>No Study Plan Yet</h4>
+                    <p className="text-zinc-500 text-sm max-w-md mx-auto">Let our AI analyze your subjects and goals to create a personalized weekly schedule tailored to your learning style.</p>
+                  </div>
+                  <button 
+                    onClick={generateWeeklyPlan}
+                    disabled={isGeneratingPlan}
+                    className="px-8 py-4 bg-indigo-600 hover:bg-indigo-500 text-white rounded-2xl font-bold transition-all shadow-xl shadow-indigo-900/40 flex items-center justify-center gap-3 mx-auto"
+                  >
+                    {isGeneratingPlan ? <Loader2 className="w-5 h-5 animate-spin" /> : <Sparkles className="w-5 h-5" />}
+                    Generate My Weekly Plan
+                  </button>
+                </div>
+              ) : (
+                <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-7 gap-4">
+                  {userSettings.weeklyStudyPlan.map((day, i) => (
+                    <motion.div 
+                      key={i}
+                      initial={{ opacity: 0, y: 20 }}
+                      animate={{ opacity: 1, y: 0 }}
+                      transition={{ delay: i * 0.05 }}
+                      className={`${userSettings.theme === 'dark' ? 'bg-zinc-900/40 border-zinc-800/50' : 'bg-white border-zinc-200'} border p-5 rounded-3xl space-y-4 group hover:border-indigo-500/50 transition-all`}
+                    >
+                      <div className="space-y-1">
+                        <p className="text-[10px] font-bold text-indigo-500 uppercase tracking-widest">{day.day}</p>
+                        <h5 className={`text-sm font-serif italic font-bold ${userSettings.theme === 'dark' ? 'text-white' : 'text-zinc-900'} truncate`}>{day.focus}</h5>
+                      </div>
+                      <div className="space-y-2">
+                        {day.tasks.map((task, j) => (
+                          <div key={j} className="flex gap-2">
+                            <div className="w-1 h-1 rounded-full bg-zinc-700 mt-1.5 shrink-0" />
+                            <p className="text-[10px] text-zinc-500 leading-tight">{task}</p>
+                          </div>
+                        ))}
+                      </div>
+                    </motion.div>
+                  ))}
+                </div>
+              )}
             </div>
 
             {/* Secondary Stats */}
@@ -2272,60 +3064,100 @@ export default function App() {
                 </div>
 
                 <div className="space-y-4">
-                  <div className="flex items-center justify-between">
+                  <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
                     <label className="text-xs font-bold text-zinc-500 uppercase tracking-widest">Your Files</label>
-                    <span className="text-[10px] text-zinc-600 font-medium">{studyFiles.length} items</span>
+                    <div className="flex items-center gap-2">
+                      <div className="relative flex-1 sm:w-48">
+                        <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-3 h-3 text-zinc-500" />
+                        <input 
+                          type="text"
+                          placeholder="Search files..."
+                          value={fileSearchQuery}
+                          onChange={(e) => setFileSearchQuery(e.target.value)}
+                          className={`w-full pl-8 pr-3 py-2 text-[10px] font-bold rounded-xl border ${userSettings.theme === 'dark' ? 'bg-zinc-950 border-zinc-800 text-zinc-300 focus:border-indigo-500' : 'bg-zinc-50 border-zinc-200 text-zinc-700 focus:border-indigo-500'} outline-none transition-all`}
+                        />
+                      </div>
+                      <select 
+                        value={fileSortBy}
+                        onChange={(e) => setFileSortBy(e.target.value as any)}
+                        className={`pl-3 pr-8 py-2 text-[10px] font-bold rounded-xl border ${userSettings.theme === 'dark' ? 'bg-zinc-950 border-zinc-800 text-zinc-300 focus:border-indigo-500' : 'bg-zinc-50 border-zinc-200 text-zinc-700 focus:border-indigo-500'} outline-none transition-all appearance-none cursor-pointer`}
+                        style={{ backgroundImage: `url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' fill='none' viewBox='0 0 24 24' stroke='%2371717a'%3E%3Cpath stroke-linecap='round' stroke-linejoin='round' stroke-width='2' d='M19 9l-7 7-7-7'%3E%3C/path%3E%3C/svg%3E")`, backgroundRepeat: 'no-repeat', backgroundPosition: 'right 0.5rem center', backgroundSize: '1rem' }}
+                      >
+                        <option value="date">Date</option>
+                        <option value="name">Name</option>
+                        <option value="type">Type</option>
+                      </select>
+                    </div>
                   </div>
                   <div className="space-y-2">
                     {studyFiles.length > 0 ? (
-                      studyFiles.map((file) => (
-                        <div key={file.id} className={`flex items-center justify-between p-4 ${userSettings.theme === 'dark' ? 'bg-zinc-950 border-zinc-800 hover:border-zinc-700' : 'bg-zinc-50 border-zinc-200 hover:border-zinc-300'} border rounded-2xl group transition-all`}>
-                          <div className="flex items-center gap-3 min-w-0">
-                            <div className={`w-10 h-10 rounded-xl ${userSettings.theme === 'dark' ? 'bg-zinc-900' : 'bg-white shadow-sm'} flex items-center justify-center flex-shrink-0`}>
-                              <FileText className="w-5 h-5 text-zinc-500" />
+                      studyFiles
+                        .filter(file => file.name.toLowerCase().includes(fileSearchQuery.toLowerCase()))
+                        .sort((a, b) => {
+                          if (fileSortBy === 'name') return a.name.localeCompare(b.name);
+                          if (fileSortBy === 'date') return new Date(b.uploadedAt).getTime() - new Date(a.uploadedAt).getTime();
+                          if (fileSortBy === 'type') {
+                            const extA = a.name.split('.').pop() || '';
+                            const extB = b.name.split('.').pop() || '';
+                            return extA.localeCompare(extB);
+                          }
+                          return 0;
+                        })
+                        .map((file) => (
+                          <div key={file.id} className={`flex items-center justify-between p-4 ${userSettings.theme === 'dark' ? 'bg-zinc-950 border-zinc-800 hover:border-zinc-700' : 'bg-zinc-50 border-zinc-200 hover:border-zinc-300'} border rounded-2xl group transition-all`}>
+                            <div className="flex items-center gap-3 min-w-0">
+                              <div className={`w-10 h-10 rounded-xl ${userSettings.theme === 'dark' ? 'bg-zinc-900' : 'bg-white shadow-sm'} flex items-center justify-center flex-shrink-0`}>
+                                <FileText className="w-5 h-5 text-zinc-500" />
+                              </div>
+                              <div className="min-w-0">
+                                <p className={`text-sm ${userSettings.theme === 'dark' ? 'text-zinc-200' : 'text-zinc-900'} font-medium truncate`}>{file.name}</p>
+                                <p className="text-[10px] text-zinc-600 uppercase tracking-widest">{new Date(file.uploadedAt).toLocaleDateString()}</p>
+                              </div>
                             </div>
-                            <div className="min-w-0">
-                              <p className={`text-sm ${userSettings.theme === 'dark' ? 'text-zinc-200' : 'text-zinc-900'} font-medium truncate`}>{file.name}</p>
-                              <p className="text-[10px] text-zinc-600 uppercase tracking-widest">{new Date(file.uploadedAt).toLocaleDateString()}</p>
+                            <div className="flex items-center gap-2">
+                              <button 
+                                onClick={() => {
+                                  setQuizTopic(file.name);
+                                  setQuizNotes(file.content);
+                                  setIsFilesModalOpen(false);
+                                  setIsQuizModalOpen(true);
+                                }}
+                                className="p-2 text-zinc-600 hover:text-indigo-400 transition-colors"
+                                title="Generate Quiz from this file"
+                              >
+                                <GraduationCap className="w-4 h-4" />
+                              </button>
+                              <button 
+                                onClick={() => {
+                                  setSummaryTopic(file.name);
+                                  setSummaryNotes(file.content);
+                                  setIsFilesModalOpen(false);
+                                  setIsSummarizerModalOpen(true);
+                                }}
+                                className="p-2 text-zinc-600 hover:text-indigo-400 transition-colors"
+                                title="Summarize this file"
+                              >
+                                <Brain className="w-4 h-4" />
+                              </button>
+                              <button 
+                                onClick={async () => {
+                                  await deleteDoc(doc(db, 'studyFiles', file.id));
+                                  toast.success("File deleted");
+                                }}
+                                className="p-2 text-zinc-600 hover:text-red-400 transition-colors"
+                              >
+                                <Trash2 className="w-4 h-4" />
+                              </button>
                             </div>
                           </div>
-                          <div className="flex items-center gap-2">
-                            <button 
-                              onClick={() => {
-                                setQuizTopic(file.name);
-                                setQuizNotes(file.content);
-                                setIsFilesModalOpen(false);
-                                setIsQuizModalOpen(true);
-                              }}
-                              className="p-2 text-zinc-600 hover:text-indigo-400 transition-colors"
-                              title="Generate Quiz from this file"
-                            >
-                              <GraduationCap className="w-4 h-4" />
-                            </button>
-                            <button 
-                              onClick={() => {
-                                setSummaryTopic(file.name);
-                                setSummaryNotes(file.content);
-                                setIsFilesModalOpen(false);
-                                setIsSummarizerModalOpen(true);
-                              }}
-                              className="p-2 text-zinc-600 hover:text-indigo-400 transition-colors"
-                              title="Summarize this file"
-                            >
-                              <Brain className="w-4 h-4" />
-                            </button>
-                            <button 
-                              onClick={async () => {
-                                await deleteDoc(doc(db, 'studyFiles', file.id));
-                                toast.success("File deleted");
-                              }}
-                              className="p-2 text-zinc-600 hover:text-red-400 transition-colors"
-                            >
-                              <Trash2 className="w-4 h-4" />
-                            </button>
+                        )).length === 0 && fileSearchQuery ? (
+                          <div className="text-center py-12 space-y-3">
+                            <div className="w-12 h-12 rounded-full bg-zinc-900 flex items-center justify-center mx-auto">
+                              <Search className="w-6 h-6 text-zinc-800" />
+                            </div>
+                            <p className="text-sm text-zinc-600 italic">No files match "{fileSearchQuery}"</p>
                           </div>
-                        </div>
-                      ))
+                        ) : null
                     ) : (
                       <div className="text-center py-12 space-y-3">
                         <div className="w-12 h-12 rounded-full bg-zinc-900 flex items-center justify-center mx-auto">
@@ -2492,6 +3324,15 @@ export default function App() {
                     </div>
 
                     <div className="flex gap-4">
+                      {summaryType === 'Flashcards' && (
+                        <button 
+                          onClick={startFlashcardStudy}
+                          className="flex-1 py-4 bg-emerald-600 hover:bg-emerald-500 text-white rounded-2xl font-bold transition-all flex items-center justify-center gap-3 shadow-xl shadow-emerald-900/40"
+                        >
+                          <Brain className="w-5 h-5" />
+                          Study Cards
+                        </button>
+                      )}
                       <button 
                         onClick={() => {
                           const blob = new Blob([summaryResult], { type: 'text/plain' });
@@ -2501,7 +3342,7 @@ export default function App() {
                           a.download = `${summaryTopic || 'Summary'}.txt`;
                           a.click();
                         }}
-                        className="flex-1 py-4 bg-zinc-800 hover:bg-zinc-700 text-white rounded-2xl font-bold transition-all flex items-center justify-center gap-3"
+                        className={`flex-1 py-4 ${summaryType === 'Flashcards' ? 'bg-zinc-800 hover:bg-zinc-700' : 'bg-zinc-800 hover:bg-zinc-700'} text-white rounded-2xl font-bold transition-all flex items-center justify-center gap-3`}
                       >
                         <Upload className="w-5 h-5" />
                         Download TXT
@@ -2516,6 +3357,115 @@ export default function App() {
                     </div>
                   </div>
                 )}
+              </div>
+            </motion.div>
+          </div>
+        )}
+      </AnimatePresence>
+
+      {/* Flashcard Study Modal */}
+      <AnimatePresence>
+        {isFlashcardStudyOpen && flashcards.length > 0 && (
+          <div className="fixed inset-0 z-[130] flex items-center justify-center p-4">
+            <motion.div 
+              initial={{ opacity: 0 }}
+              animate={{ opacity: 1 }}
+              exit={{ opacity: 0 }}
+              onClick={() => setIsFlashcardStudyOpen(false)}
+              className="absolute inset-0 bg-black/90 backdrop-blur-xl"
+            />
+            <motion.div 
+              initial={{ opacity: 0, scale: 0.9, y: 20 }}
+              animate={{ opacity: 1, scale: 1, y: 0 }}
+              exit={{ opacity: 0, scale: 0.9, y: 20 }}
+              className="relative w-full max-w-2xl flex flex-col items-center space-y-12"
+            >
+              {/* Header */}
+              <div className="text-center space-y-2">
+                <div className="flex items-center justify-center gap-2 text-xs font-bold text-indigo-400 uppercase tracking-[0.3em]">
+                  <Brain className="w-4 h-4" />
+                  Flashcard Mastery
+                </div>
+                <h2 className="text-3xl font-serif italic font-bold text-white tracking-tight">
+                  {summaryTopic || 'Study Session'}
+                </h2>
+                <div className="flex items-center justify-center gap-4 pt-2">
+                  <div className="px-3 py-1 bg-zinc-900 border border-zinc-800 rounded-full text-[10px] font-bold text-zinc-500 uppercase tracking-widest">
+                    Card {currentFlashcardIndex + 1} of {flashcards.length}
+                  </div>
+                </div>
+              </div>
+
+              {/* Card Container */}
+              <div className="w-full max-w-md aspect-[4/3] perspective-1000">
+                <motion.div 
+                  onClick={() => setIsFlashcardFlipped(!isFlashcardFlipped)}
+                  animate={{ rotateY: isFlashcardFlipped ? 180 : 0 }}
+                  transition={{ duration: 0.6, type: "spring", stiffness: 260, damping: 20 }}
+                  className="relative w-full h-full cursor-pointer preserve-3d"
+                >
+                  {/* Front */}
+                  <div className={`absolute inset-0 w-full h-full backface-hidden bg-zinc-900 border-2 border-zinc-800 rounded-[2.5rem] p-10 flex flex-col items-center justify-center text-center space-y-6 shadow-2xl ${isFlashcardFlipped ? 'pointer-events-none' : ''}`}>
+                    <div className="w-12 h-12 rounded-2xl bg-indigo-600/20 flex items-center justify-center">
+                      <Search className="w-6 h-6 text-indigo-400" />
+                    </div>
+                    <p className="text-2xl font-serif italic font-medium text-white leading-relaxed">
+                      {flashcards[currentFlashcardIndex].question}
+                    </p>
+                    <p className="text-[10px] font-bold text-zinc-600 uppercase tracking-widest animate-pulse">Click to reveal answer</p>
+                  </div>
+
+                  {/* Back */}
+                  <div className={`absolute inset-0 w-full h-full backface-hidden bg-indigo-600 border-2 border-indigo-500 rounded-[2.5rem] p-10 flex flex-col items-center justify-center text-center space-y-6 shadow-2xl [transform:rotateY(180deg)] ${!isFlashcardFlipped ? 'pointer-events-none' : ''}`}>
+                    <div className="w-12 h-12 rounded-2xl bg-white/20 flex items-center justify-center">
+                      <CheckCircle2 className="w-6 h-6 text-white" />
+                    </div>
+                    <div className="text-lg text-indigo-50 leading-relaxed max-h-[200px] overflow-y-auto scrollbar-thin scrollbar-thumb-white/20 pr-2">
+                      {flashcards[currentFlashcardIndex].answer}
+                    </div>
+                    <p className="text-[10px] font-bold text-indigo-200 uppercase tracking-widest">Click to flip back</p>
+                  </div>
+                </motion.div>
+              </div>
+
+              {/* Controls */}
+              <div className="flex items-center gap-6">
+                <button 
+                  onClick={() => {
+                    if (currentFlashcardIndex > 0) {
+                      setCurrentFlashcardIndex(currentFlashcardIndex - 1);
+                      setIsFlashcardFlipped(false);
+                    }
+                  }}
+                  disabled={currentFlashcardIndex === 0}
+                  className="w-14 h-14 rounded-full bg-zinc-900 border border-zinc-800 flex items-center justify-center text-zinc-500 hover:text-white hover:border-zinc-700 disabled:opacity-30 disabled:cursor-not-allowed transition-all"
+                >
+                  <RotateCcw className="w-6 h-6 -scale-x-100" />
+                </button>
+                
+                <button 
+                  onClick={() => setIsFlashcardStudyOpen(false)}
+                  className="px-8 py-4 bg-white text-zinc-950 rounded-2xl font-bold hover:scale-105 transition-all shadow-xl shadow-white/10"
+                >
+                  Finish Study
+                </button>
+
+                <button 
+                  onClick={() => {
+                    if (currentFlashcardIndex < flashcards.length - 1) {
+                      setCurrentFlashcardIndex(currentFlashcardIndex + 1);
+                      setIsFlashcardFlipped(false);
+                    } else {
+                      setIsFlashcardStudyOpen(false);
+                      toast.success("Study session complete!", {
+                        icon: <Trophy className="w-5 h-5 text-yellow-500" />
+                      });
+                    }
+                  }}
+                  className="w-14 h-14 rounded-full bg-zinc-900 border border-zinc-800 flex items-center justify-center text-zinc-500 hover:text-indigo-400 hover:border-indigo-400/50 transition-all"
+                >
+                  <ArrowRight className="w-6 h-6" />
+                </button>
               </div>
             </motion.div>
           </div>
