@@ -4,7 +4,7 @@
  */
 
 import React, { useState, useRef, useEffect, FormEvent } from 'react';
-import { GoogleGenAI, GenerateContentResponse, Type } from "@google/genai";
+import { GoogleGenAI, Type } from "@google/genai";
 import { Toaster, toast } from 'sonner';
 import { 
   Send, 
@@ -18,7 +18,6 @@ import {
   Clock, 
   CheckCircle, 
   LogIn, 
-  LogOut, 
   Settings, 
   Bell, 
   Target, 
@@ -374,8 +373,8 @@ export default function App() {
 
   const calculateLevel = (xp: number) => Math.floor(xp / XP_PER_LEVEL) + 1;
 
-  const checkMilestones = (stats: UserStats) => {
-    const newBadges: string[] = [...(userSettings.badges || [])];
+  const checkMilestones = (stats: UserStats, currentBadges?: string[]) => {
+    const newBadges: string[] = [...(currentBadges ?? userSettings.badges ?? [])];
     let earned = false;
 
     // Global Milestones
@@ -521,6 +520,18 @@ export default function App() {
           }
           if (newDailyXpHistory.length > 14) newDailyXpHistory = newDailyXpHistory.slice(-14);
 
+          // Update global streak
+          const lastActive = userSettings.stats.lastActiveDate;
+          let newStreak = userSettings.stats.streak;
+          if (lastActive === yesterday) {
+            newStreak = newStreak + 1;
+          } else if (lastActive !== today) {
+            newStreak = 1; // reset streak if gap > 1 day
+          }
+
+          // focusScore: percentage of daily goal met (capped at 100)
+          const newFocusScore = Math.min(100, Math.round((newTodayHours / userSettings.dailyGoal) * 100));
+
           const newStats = {
             ...userSettings.stats,
             xp: newXp,
@@ -528,6 +539,8 @@ export default function App() {
             sessionsCompleted: newSessions,
             todayHours: newTodayHours,
             weeklyHours: newWeeklyHours,
+            streak: newStreak,
+            focusScore: newFocusScore,
             lastActiveDate: today,
             subjectStats: updatedSubjectStats,
             mostStudiedSubject: mostStudied,
@@ -576,22 +589,15 @@ export default function App() {
 
   const startTimer = () => {
     if (!sessionTopic.trim() || !sessionGoal.trim()) return;
-    // Sync subject from customSubject if filled
-    if (customSubject.trim()) {
-      setSelectedSubject(customSubject.trim());
-    }
+    const subject = customSubject.trim() || selectedSubject;
+    if (customSubject.trim()) setSelectedSubject(customSubject.trim());
     setTimeLeft(sessionDuration * 60);
     setIsTimerRunning(true);
     setIsTimerActive(true);
     setIsSessionSetupOpen(false);
-    // Auto-send an opening message to the AI
-    const openingMsg = `I'm starting a ${sessionDuration}-minute ${timerMode} study session on "${sessionTopic}" (${customSubject.trim() || selectedSubject}). My goal: ${sessionGoal}. Please give me a brief motivational kickoff and one key tip for this topic.`;
-    setInput(openingMsg);
-    // Use setTimeout so the input state is set before handleSend reads it
-    setTimeout(() => {
-      const btn = document.getElementById('chat-send-btn');
-      btn?.click();
-    }, 100);
+    // Directly trigger AI kickoff — bypass input state
+    const openingMsg = `I'm starting a ${sessionDuration}-minute ${timerMode} study session on "${sessionTopic}" (${subject}). My goal: ${sessionGoal}. Please give me a brief motivational kickoff and one key tip for this topic.`;
+    handleSendMessage(openingMsg);
   };
 
   const toggleTimer = () => setIsTimerRunning(!isTimerRunning);
@@ -690,20 +696,37 @@ export default function App() {
     const file = e.target.files?.[0];
     if (!file || !user) return;
 
+    // Block PDF — readAsText produces garbled output for binary files
+    if (file.type === 'application/pdf') {
+      toast.error("PDF files are not supported yet. Please upload .txt or .md files.");
+      e.target.value = '';
+      return;
+    }
+
     setIsUploading(true);
     try {
       const reader = new FileReader();
       reader.onload = async (event) => {
-        const content = event.target?.result as string;
-        const fileData = {
-          name: file.name,
-          type: file.type,
-          content: content.substring(0, 500000), // Limit content size for Firestore
-          uploadedAt: serverTimestamp(),
-          userId: user.uid
-        };
-        await addDoc(collection(db, 'studyFiles'), fileData);
-        toast.success("File uploaded successfully!");
+        try {
+          const content = event.target?.result as string;
+          const fileData = {
+            name: file.name,
+            type: file.type,
+            content: content.substring(0, 500000),
+            uploadedAt: serverTimestamp(),
+            userId: user.uid
+          };
+          await addDoc(collection(db, 'studyFiles'), fileData);
+          toast.success(`"${file.name}" uploaded successfully!`);
+        } catch (err) {
+          console.error("Firestore upload error:", err);
+          toast.error("Failed to save file. Please try again.");
+        } finally {
+          setIsUploading(false);
+        }
+      };
+      reader.onerror = () => {
+        toast.error("Failed to read file.");
         setIsUploading(false);
       };
       reader.readAsText(file);
@@ -712,6 +735,8 @@ export default function App() {
       toast.error("Failed to upload file.");
       setIsUploading(false);
     }
+    // Reset input so the same file can be re-uploaded
+    e.target.value = '';
   };
 
   const generateQuiz = async () => {
@@ -993,32 +1018,37 @@ export default function App() {
   const startFlashcardStudy = () => {
     if (!summaryResult || summaryType !== 'Flashcards') return;
 
-    // Parse Flashcards from summaryResult
-    // Expected format: Q: [Question] \n A: [Answer]
     const cards: Flashcard[] = [];
+
+    // Strategy 1: Q:/A: line-by-line format
     const lines = summaryResult.split('\n');
     let currentQ = '';
     let currentA = '';
-
     lines.forEach(line => {
       const trimmed = line.trim();
-      if (trimmed.startsWith('Q:') || trimmed.startsWith('Question:')) {
-        if (currentQ && currentA) {
-          cards.push({ question: currentQ, answer: currentA });
-        }
-        currentQ = trimmed.replace(/^(Q:|Question:)\s*/, '');
+      if (/^(Q:|Question:|\d+\.\s*Q:)/i.test(trimmed)) {
+        if (currentQ && currentA) cards.push({ question: currentQ, answer: currentA });
+        currentQ = trimmed.replace(/^(\d+\.\s*)?(Q:|Question:)\s*/i, '');
         currentA = '';
-      } else if (trimmed.startsWith('A:') || trimmed.startsWith('Answer:')) {
-        currentA = trimmed.replace(/^(A:|Answer:)\s*/, '');
+      } else if (/^(A:|Answer:)/i.test(trimmed)) {
+        currentA = trimmed.replace(/^(A:|Answer:)\s*/i, '');
       } else if (trimmed && currentQ && !currentA) {
         currentQ += ' ' + trimmed;
       } else if (trimmed && currentA) {
         currentA += ' ' + trimmed;
       }
     });
+    if (currentQ && currentA) cards.push({ question: currentQ, answer: currentA });
 
-    if (currentQ && currentA) {
-      cards.push({ question: currentQ, answer: currentA });
+    // Strategy 2: numbered pairs "1. Question\nAnswer" if strategy 1 found nothing
+    if (cards.length === 0) {
+      const blocks = summaryResult.split(/\n\s*\n/).filter(b => b.trim());
+      blocks.forEach(block => {
+        const parts = block.split('\n').map(l => l.trim()).filter(Boolean);
+        if (parts.length >= 2) {
+          cards.push({ question: parts[0].replace(/^\d+\.\s*/, ''), answer: parts.slice(1).join(' ') });
+        }
+      });
     }
 
     if (cards.length > 0) {
@@ -1028,7 +1058,7 @@ export default function App() {
       setIsFlashcardStudyOpen(true);
       setIsSummarizerModalOpen(false);
     } else {
-      toast.error("Could not parse flashcards. Please try again.");
+      toast.error("Could not parse flashcards. Try regenerating with 'Flashcards' type selected.");
     }
   };
 
@@ -1379,11 +1409,14 @@ export default function App() {
     }
   };
 
-  const handleSend = async () => {
-    if (!input.trim() || isLoading || !user) return;
-
-    const userContent = input.trim();
+  // Core send function — accepts an explicit message or falls back to `input` state
+  const handleSendMessage = async (explicitMsg?: string) => {
+    const userContent = (explicitMsg ?? input).trim();
+    if (!userContent || isLoading || !user) return;
     
+    // Clear input only when sending from the text box (not programmatic calls)
+    if (!explicitMsg) setInput('');
+
     // Focus Protocol Enforcement
     if (isTimerRunning) {
       const mentionedBlocked = userSettings.blockedApps.find(app => 
@@ -1402,7 +1435,6 @@ export default function App() {
       return;
     }
 
-    setInput('');
     setIsLoading(true);
 
     try {
@@ -1417,7 +1449,8 @@ export default function App() {
 
       const response = await ai.models.generateContent({
         model: "gemini-2.5-flash-lite",
-        contents: [...messages, { role: 'user', content: userContent }].map(m => ({
+        // Keep last 20 messages to avoid token limit errors on long conversations
+        contents: [...messages.slice(-20), { role: 'user', content: userContent }].map(m => ({
           role: m.role === 'assistant' ? 'model' : 'user',
           parts: [{ text: m.content }]
         })),
@@ -1461,6 +1494,9 @@ export default function App() {
       setIsLoading(false);
     }
   };
+
+  // Thin wrapper for button onClick handlers
+  const handleSend = () => handleSendMessage();
 
   const clearChat = async () => {
     if (!user) return;
@@ -1525,6 +1561,13 @@ export default function App() {
   return (
     <div className={`flex flex-col h-screen ${userSettings.theme === 'dark' ? 'bg-[#0a0a0a] text-zinc-100' : 'bg-zinc-50 text-zinc-900'} font-sans selection:bg-indigo-500/30 overflow-hidden transition-colors duration-500`}>
       <Toaster position="top-right" theme={userSettings.theme} richColors closeButton />
+
+      {/* Auth loading gate — prevents flash of landing page for logged-in users */}
+      {!isAuthReady && !showSplash && (
+        <div className="fixed inset-0 z-[500] bg-[#0a0a0a] flex items-center justify-center">
+          <Loader2 className="w-8 h-8 text-indigo-500 animate-spin" />
+        </div>
+      )}
       
       {/* Focus Mode Overlay */}
       <AnimatePresence>
@@ -2553,7 +2596,7 @@ export default function App() {
               <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
                 {userSettings.subjects.map((subject) => {
                   const stats = userSettings.stats.subjectStats[subject] || { xp: 0, level: 1, badges: [], studyStreak: 0 };
-                  const progress = stats.xp % 100;
+                  const progress = Math.min(100, Math.round((stats.xp % XP_PER_LEVEL) / XP_PER_LEVEL * 100));
                   
                   return (
                     <motion.div 
@@ -2649,9 +2692,15 @@ export default function App() {
                     <div className={`px-5 py-4 rounded-2xl text-sm leading-relaxed shadow-sm ${
                       message.role === 'user' 
                         ? 'bg-indigo-600 text-white rounded-tr-none font-medium' 
-                        : 'bg-zinc-900 border border-zinc-800/50 text-zinc-300 rounded-tl-none'
+                        : `${userSettings.theme === 'dark' ? 'bg-zinc-900 border-zinc-800/50 text-zinc-300' : 'bg-white border-zinc-200 text-zinc-700'} border rounded-tl-none`
                     }`}>
-                      {message.content}
+                      {message.role === 'assistant' ? (
+                        <div className="prose prose-sm prose-invert max-w-none [&>*:first-child]:mt-0 [&>*:last-child]:mb-0">
+                          <Markdown>{message.content}</Markdown>
+                        </div>
+                      ) : (
+                        message.content
+                      )}
                     </div>
                     <span className="text-[10px] text-zinc-600 font-mono">
                       {message.timestamp.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
@@ -3133,7 +3182,7 @@ export default function App() {
                   <div className="relative">
                     <input 
                       type="file" 
-                      accept=".txt,.md,.pdf"
+                      accept=".txt,.md,.csv,.json"
                       onChange={handleFileUpload}
                       className="hidden" 
                       id="file-upload"
@@ -3237,8 +3286,13 @@ export default function App() {
                               </button>
                               <button 
                                 onClick={async () => {
-                                  await deleteDoc(doc(db, 'studyFiles', file.id));
-                                  toast.success("File deleted");
+                                  try {
+                                    await deleteDoc(doc(db, 'studyFiles', file.id));
+                                    toast.success("File deleted");
+                                  } catch (err) {
+                                    console.error("Delete error:", err);
+                                    toast.error("Failed to delete file.");
+                                  }
                                 }}
                                 className="p-2 text-zinc-600 hover:text-red-400 transition-colors"
                               >
@@ -3474,8 +3528,16 @@ export default function App() {
               initial={{ opacity: 0, scale: 0.9, y: 20 }}
               animate={{ opacity: 1, scale: 1, y: 0 }}
               exit={{ opacity: 0, scale: 0.9, y: 20 }}
-              className="relative w-full max-w-2xl flex flex-col items-center space-y-12"
+              className="relative w-full max-w-2xl flex flex-col items-center space-y-10"
             >
+              {/* Close */}
+              <button
+                onClick={() => setIsFlashcardStudyOpen(false)}
+                className="absolute -top-2 right-0 p-2 text-zinc-500 hover:text-white hover:bg-zinc-800 rounded-xl transition-all"
+              >
+                <X className="w-5 h-5" />
+              </button>
+
               {/* Header */}
               <div className="text-center space-y-2">
                 <div className="flex items-center justify-center gap-2 text-xs font-bold text-indigo-400 uppercase tracking-[0.3em]">
@@ -3485,41 +3547,49 @@ export default function App() {
                 <h2 className="text-3xl font-serif italic font-bold text-white tracking-tight">
                   {summaryTopic || 'Study Session'}
                 </h2>
-                <div className="flex items-center justify-center gap-4 pt-2">
+                <div className="flex items-center justify-center gap-3 pt-1">
                   <div className="px-3 py-1 bg-zinc-900 border border-zinc-800 rounded-full text-[10px] font-bold text-zinc-500 uppercase tracking-widest">
                     Card {currentFlashcardIndex + 1} of {flashcards.length}
+                  </div>
+                  {/* Progress dots */}
+                  <div className="flex gap-1">
+                    {flashcards.map((_, i) => (
+                      <div key={i} className={`w-1.5 h-1.5 rounded-full transition-all ${i === currentFlashcardIndex ? 'bg-indigo-400 w-4' : i < currentFlashcardIndex ? 'bg-emerald-500' : 'bg-zinc-700'}`} />
+                    ))}
                   </div>
                 </div>
               </div>
 
-              {/* Card Container */}
-              <div className="w-full max-w-md aspect-[4/3] perspective-1000">
+              {/* Card */}
+              <div className="w-full max-w-md" style={{ perspective: '1000px' }}>
                 <motion.div 
                   onClick={() => setIsFlashcardFlipped(!isFlashcardFlipped)}
                   animate={{ rotateY: isFlashcardFlipped ? 180 : 0 }}
-                  transition={{ duration: 0.6, type: "spring", stiffness: 260, damping: 20 }}
-                  className="relative w-full h-full cursor-pointer preserve-3d"
+                  transition={{ duration: 0.5, type: "spring", stiffness: 300, damping: 25 }}
+                  style={{ height: '260px', transformStyle: 'preserve-3d' } as React.CSSProperties}
+                  className="relative w-full cursor-pointer"
                 >
                   {/* Front */}
-                  <div className={`absolute inset-0 w-full h-full backface-hidden bg-zinc-900 border-2 border-zinc-800 rounded-[2.5rem] p-10 flex flex-col items-center justify-center text-center space-y-6 shadow-2xl ${isFlashcardFlipped ? 'pointer-events-none' : ''}`}>
-                    <div className="w-12 h-12 rounded-2xl bg-indigo-600/20 flex items-center justify-center">
-                      <Search className="w-6 h-6 text-indigo-400" />
+                  <div className="absolute inset-0 bg-zinc-900 border-2 border-zinc-800 rounded-[2rem] p-8 flex flex-col items-center justify-center text-center space-y-4 shadow-2xl"
+                    style={{ backfaceVisibility: 'hidden' }}>
+                    <div className="w-10 h-10 rounded-2xl bg-indigo-600/20 flex items-center justify-center">
+                      <Brain className="w-5 h-5 text-indigo-400" />
                     </div>
-                    <p className="text-2xl font-serif italic font-medium text-white leading-relaxed">
+                    <p className="text-xl font-serif italic font-medium text-white leading-relaxed">
                       {flashcards[currentFlashcardIndex].question}
                     </p>
-                    <p className="text-[10px] font-bold text-zinc-600 uppercase tracking-widest animate-pulse">Click to reveal answer</p>
+                    <p className="text-[10px] font-bold text-zinc-600 uppercase tracking-widest animate-pulse">Tap to reveal answer</p>
                   </div>
-
                   {/* Back */}
-                  <div className={`absolute inset-0 w-full h-full backface-hidden bg-indigo-600 border-2 border-indigo-500 rounded-[2.5rem] p-10 flex flex-col items-center justify-center text-center space-y-6 shadow-2xl [transform:rotateY(180deg)] ${!isFlashcardFlipped ? 'pointer-events-none' : ''}`}>
-                    <div className="w-12 h-12 rounded-2xl bg-white/20 flex items-center justify-center">
-                      <CheckCircle2 className="w-6 h-6 text-white" />
+                  <div className="absolute inset-0 bg-indigo-600 border-2 border-indigo-500 rounded-[2rem] p-8 flex flex-col items-center justify-center text-center space-y-4 shadow-2xl"
+                    style={{ backfaceVisibility: 'hidden', transform: 'rotateY(180deg)' }}>
+                    <div className="w-10 h-10 rounded-2xl bg-white/20 flex items-center justify-center">
+                      <CheckCircle2 className="w-5 h-5 text-white" />
                     </div>
-                    <div className="text-lg text-indigo-50 leading-relaxed max-h-[200px] overflow-y-auto scrollbar-thin scrollbar-thumb-white/20 pr-2">
+                    <div className="text-base text-indigo-50 leading-relaxed overflow-y-auto max-h-[140px] scrollbar-thin scrollbar-thumb-white/20 pr-1">
                       {flashcards[currentFlashcardIndex].answer}
                     </div>
-                    <p className="text-[10px] font-bold text-indigo-200 uppercase tracking-widest">Click to flip back</p>
+                    <p className="text-[10px] font-bold text-indigo-200 uppercase tracking-widest">Tap to flip back</p>
                   </div>
                 </motion.div>
               </div>
@@ -3527,35 +3597,37 @@ export default function App() {
               {/* Controls */}
               <div className="flex items-center gap-6">
                 <button 
-                  onClick={() => {
-                    if (currentFlashcardIndex > 0) {
-                      setCurrentFlashcardIndex(currentFlashcardIndex - 1);
-                      setIsFlashcardFlipped(false);
-                    }
-                  }}
+                  onClick={() => { if (currentFlashcardIndex > 0) { setCurrentFlashcardIndex(i => i - 1); setIsFlashcardFlipped(false); } }}
                   disabled={currentFlashcardIndex === 0}
                   className="w-14 h-14 rounded-full bg-zinc-900 border border-zinc-800 flex items-center justify-center text-zinc-500 hover:text-white hover:border-zinc-700 disabled:opacity-30 disabled:cursor-not-allowed transition-all"
                 >
-                  <RotateCcw className="w-6 h-6 -scale-x-100" />
+                  <RotateCcw className="w-5 h-5 -scale-x-100" />
                 </button>
                 
                 <button 
-                  onClick={() => setIsFlashcardStudyOpen(false)}
-                  className="px-8 py-4 bg-white text-zinc-950 rounded-2xl font-bold hover:scale-105 transition-all shadow-xl shadow-white/10"
+                  onClick={() => { setIsFlashcardStudyOpen(false); }}
+                  className="px-8 py-4 bg-white text-zinc-950 rounded-2xl font-bold hover:scale-105 transition-all shadow-xl"
                 >
-                  Finish Study
+                  Finish
                 </button>
 
                 <button 
                   onClick={() => {
                     if (currentFlashcardIndex < flashcards.length - 1) {
-                      setCurrentFlashcardIndex(currentFlashcardIndex + 1);
+                      setCurrentFlashcardIndex(i => i + 1);
                       setIsFlashcardFlipped(false);
                     } else {
+                      // Award XP for completing all flashcards
+                      const xpEarned = XP_SUMMARY;
+                      const newTotalXp = userSettings.stats.xp + xpEarned;
+                      const today = new Date().toISOString().split('T')[0];
+                      let newDailyXpHistory = [...(userSettings.stats.dailyXpHistory || [])];
+                      const idx = newDailyXpHistory.findIndex(h => h.date === today);
+                      if (idx > -1) newDailyXpHistory[idx].xp += xpEarned;
+                      else newDailyXpHistory.push({ date: today, xp: xpEarned });
+                      updateSettings({ stats: { ...userSettings.stats, xp: newTotalXp, level: calculateLevel(newTotalXp), dailyXpHistory: newDailyXpHistory } });
                       setIsFlashcardStudyOpen(false);
-                      toast.success("Study session complete!", {
-                        icon: <Trophy className="w-5 h-5 text-yellow-500" />
-                      });
+                      toast.success(`All ${flashcards.length} cards done! +${xpEarned} XP`, { icon: <Trophy className="w-5 h-5 text-yellow-500" /> });
                     }
                   }}
                   className="w-14 h-14 rounded-full bg-zinc-900 border border-zinc-800 flex items-center justify-center text-zinc-500 hover:text-indigo-400 hover:border-indigo-400/50 transition-all"
@@ -3933,58 +4005,57 @@ export default function App() {
               initial={{ opacity: 0, scale: 0.9, y: 20 }}
               animate={{ opacity: 1, scale: 1, y: 0 }}
               exit={{ opacity: 0, scale: 0.9, y: 20 }}
-              className="relative w-full max-w-xl bg-zinc-900 border border-zinc-800 rounded-[2.5rem] shadow-2xl overflow-hidden flex flex-col max-h-[80vh]"
+              className={`relative w-full max-w-xl ${userSettings.theme === 'dark' ? 'bg-zinc-900 border-zinc-800' : 'bg-white border-zinc-200'} border rounded-[2.5rem] shadow-2xl overflow-hidden flex flex-col max-h-[80vh] transition-colors duration-500`}
             >
-              <div className="p-6 border-b border-zinc-800 flex items-center justify-between">
+              <div className={`p-6 border-b ${userSettings.theme === 'dark' ? 'border-zinc-800' : 'border-zinc-100'} flex items-center justify-between`}>
                 <div className="flex items-center gap-3">
                   <div className="w-10 h-10 rounded-2xl bg-indigo-600/20 flex items-center justify-center">
                     <Search className="w-5 h-5 text-indigo-400" />
                   </div>
                   <div>
-                    <h2 className="text-xl font-serif italic font-bold text-white">AI Quick Lookup</h2>
+                    <h2 className={`text-xl font-serif italic font-bold ${userSettings.theme === 'dark' ? 'text-white' : 'text-zinc-900'}`}>AI Quick Lookup</h2>
                     <p className="text-[10px] text-zinc-500 font-bold uppercase tracking-widest">Ask anything while you study</p>
                   </div>
                 </div>
                 <button 
                   onClick={() => setIsAiSearchOpen(false)}
-                  className="p-2 text-zinc-500 hover:text-white hover:bg-zinc-800 rounded-xl transition-all"
+                  className={`p-2 ${userSettings.theme === 'dark' ? 'text-zinc-500 hover:text-white hover:bg-zinc-800' : 'text-zinc-400 hover:text-zinc-900 hover:bg-zinc-100'} rounded-xl transition-all`}
                 >
                   <X className="w-5 h-5" />
                 </button>
               </div>
 
-              <div className="flex-1 overflow-y-auto p-8 space-y-6 scrollbar-thin scrollbar-thumb-zinc-800">
-                <div className="space-y-4">
-                  <div className="relative">
-                    <input 
-                      type="text" 
-                      placeholder="Ask a quick question..."
-                      value={aiSearchInput}
-                      onChange={(e) => setAiSearchInput(e.target.value)}
-                      onKeyDown={(e) => e.key === 'Enter' && handleAiSearch()}
-                      className="w-full bg-zinc-950 border border-zinc-800 rounded-2xl px-5 py-4 text-sm focus:ring-2 focus:ring-indigo-500 outline-none transition-all pr-12 text-white"
-                    />
-                    <button 
-                      onClick={handleAiSearch}
-                      disabled={isSearchingAi || !aiSearchInput.trim()}
-                      className="absolute right-3 top-1/2 -translate-y-1/2 p-2 text-indigo-400 hover:text-indigo-300 disabled:text-zinc-700 transition-colors"
-                    >
-                      {isSearchingAi ? <Loader2 className="w-5 h-5 animate-spin" /> : <Send className="w-5 h-5" />}
-                    </button>
-                  </div>
+              <div className={`flex-1 overflow-y-auto p-6 space-y-4 scrollbar-thin ${userSettings.theme === 'dark' ? 'scrollbar-thumb-zinc-800' : 'scrollbar-thumb-zinc-200'}`}>
+                <div className="relative">
+                  <input 
+                    type="text" 
+                    placeholder="Ask a quick question..."
+                    value={aiSearchInput}
+                    onChange={(e) => setAiSearchInput(e.target.value)}
+                    onKeyDown={(e) => e.key === 'Enter' && handleAiSearch()}
+                    autoFocus
+                    className={`w-full ${userSettings.theme === 'dark' ? 'bg-zinc-950 border-zinc-800 text-white placeholder-zinc-600' : 'bg-zinc-50 border-zinc-200 text-zinc-900 placeholder-zinc-400'} border rounded-2xl px-5 py-4 text-sm focus:ring-2 focus:ring-indigo-500 outline-none transition-all pr-14`}
+                  />
+                  <button 
+                    onClick={handleAiSearch}
+                    disabled={isSearchingAi || !aiSearchInput.trim()}
+                    className="absolute right-3 top-1/2 -translate-y-1/2 p-2 text-indigo-400 hover:text-indigo-300 disabled:text-zinc-600 transition-colors"
+                  >
+                    {isSearchingAi ? <Loader2 className="w-5 h-5 animate-spin" /> : <Send className="w-5 h-5" />}
+                  </button>
                 </div>
 
                 {aiSearchResponse && (
                   <motion.div 
-                    initial={{ opacity: 0, y: 10 }}
+                    initial={{ opacity: 0, y: 8 }}
                     animate={{ opacity: 1, y: 0 }}
-                    className="p-6 bg-zinc-950 border border-zinc-800 rounded-2xl space-y-4"
+                    className={`p-5 ${userSettings.theme === 'dark' ? 'bg-zinc-950 border-zinc-800' : 'bg-zinc-50 border-zinc-200'} border rounded-2xl space-y-3`}
                   >
                     <div className="flex items-center gap-2 text-[10px] font-bold text-indigo-400 uppercase tracking-widest">
                       <Bot className="w-3 h-3" />
                       AI Response
                     </div>
-                    <div className="text-sm text-zinc-300 leading-relaxed prose prose-invert prose-sm max-w-none">
+                    <div className={`text-sm ${userSettings.theme === 'dark' ? 'text-zinc-300' : 'text-zinc-700'} leading-relaxed prose prose-sm ${userSettings.theme === 'dark' ? 'prose-invert' : ''} max-w-none`}>
                       <Markdown>{aiSearchResponse}</Markdown>
                     </div>
                   </motion.div>
@@ -4011,6 +4082,16 @@ export default function App() {
               exit={{ opacity: 0, scale: 0.9, y: 20 }}
               className={`relative w-full max-w-lg ${userSettings.theme === 'dark' ? 'bg-zinc-900 border-zinc-800' : 'bg-white border-zinc-200'} border rounded-[2.5rem] shadow-2xl overflow-hidden transition-colors duration-500`}
             >
+              {/* Escape hatch — only shown when quiz generation failed */}
+              {!isGeneratingExitQuiz && exitQuizQuestions.length === 0 && !isExitQuizCompleted && (
+                <button
+                  onClick={() => { setIsSmartExitModalOpen(false); resetTimer(); }}
+                  className={`absolute top-4 right-4 p-2 ${userSettings.theme === 'dark' ? 'text-zinc-600 hover:text-white hover:bg-zinc-800' : 'text-zinc-400 hover:text-zinc-900 hover:bg-zinc-100'} rounded-xl transition-all z-10`}
+                  title="Skip and exit"
+                >
+                  <X className="w-5 h-5" />
+                </button>
+              )}
               <div className="p-8 space-y-8">
                 <div className="text-center space-y-2">
                   <div className="w-16 h-16 rounded-3xl bg-amber-500/20 flex items-center justify-center mx-auto mb-4">
@@ -4044,14 +4125,50 @@ export default function App() {
                         onClick={() => {
                           setIsSmartExitModalOpen(false);
                           if (exitReason === 'finish') {
-                            setTimeLeft(0);
+                            // Trigger session completion with actual elapsed time
+                            const elapsed = sessionDuration - Math.floor(timeLeft / 60);
+                            const elapsedMins = Math.max(1, elapsed);
+                            if (user) {
+                              const sessionHours = elapsedMins / 60;
+                              const today = new Date().toISOString().split('T')[0];
+                              const yesterday = new Date(Date.now() - 86400000).toISOString().split('T')[0];
+                              const xpEarned = Math.floor(elapsedMins * XP_PER_SESSION_MIN);
+                              const newXp = userSettings.stats.xp + xpEarned;
+                              const newSessions = userSettings.stats.sessionsCompleted + 1;
+                              const newTodayHours = userSettings.stats.todayHours + sessionHours;
+                              const lastActive = userSettings.stats.lastActiveDate;
+                              let newStreak = userSettings.stats.streak;
+                              if (lastActive === yesterday) newStreak += 1;
+                              else if (lastActive !== today) newStreak = 1;
+                              const newFocusScore = Math.min(100, Math.round((newTodayHours / userSettings.dailyGoal) * 100));
+                              let newDailyXpHistory = [...(userSettings.stats.dailyXpHistory || [])];
+                              const idx = newDailyXpHistory.findIndex(h => h.date === today);
+                              if (idx > -1) newDailyXpHistory[idx].xp += xpEarned;
+                              else newDailyXpHistory.push({ date: today, xp: xpEarned });
+                              if (newDailyXpHistory.length > 14) newDailyXpHistory = newDailyXpHistory.slice(-14);
+                              const newStats = {
+                                ...userSettings.stats,
+                                xp: newXp,
+                                level: calculateLevel(newXp),
+                                sessionsCompleted: newSessions,
+                                todayHours: newTodayHours,
+                                weeklyHours: userSettings.stats.weeklyHours + sessionHours,
+                                streak: newStreak,
+                                focusScore: newFocusScore,
+                                lastActiveDate: today,
+                                dailyXpHistory: newDailyXpHistory,
+                              };
+                              updateSettings({ stats: newStats });
+                              toast.success(`Session finished! +${xpEarned} XP earned`, { icon: <CheckCircle2 className="w-5 h-5 text-emerald-500" /> });
+                            }
+                            resetTimer();
                           } else {
                             resetTimer();
                           }
                         }}
                         className={`w-full py-4 ${userSettings.theme === 'dark' ? 'bg-zinc-800 hover:bg-zinc-700 text-white' : 'bg-zinc-100 hover:bg-zinc-200 text-zinc-900'} rounded-2xl font-bold transition-all`}
                       >
-                        {exitReason === 'finish' ? 'Finish Session' : 'Exit Session'}
+                        {exitReason === 'finish' ? 'Finish & Claim XP' : 'Exit Session'}
                       </button>
                       <button 
                         onClick={() => {
