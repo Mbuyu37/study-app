@@ -62,8 +62,19 @@ import { auth, db, googleProvider } from './firebase';
 import { signInWithPopup, signOut, onAuthStateChanged, User as FirebaseUser, createUserWithEmailAndPassword, signInWithEmailAndPassword, updateProfile } from 'firebase/auth';
 import { collection, addDoc, query, where, orderBy, onSnapshot, serverTimestamp, Timestamp, getDocs, doc, getDocFromServer, writeBatch, setDoc, getDoc, deleteDoc } from 'firebase/firestore';
 
-// Initialize Gemini AI
-const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY || '' });
+// Gemini AI — initialized lazily so the key can be set at runtime
+function createAiClient(key: string) {
+  return new GoogleGenAI({ apiKey: key });
+}
+
+const GEMINI_KEY_STORAGE = 'study_focus_gemini_key';
+
+function getStoredGeminiKey(): string {
+  return localStorage.getItem(GEMINI_KEY_STORAGE) || process.env.GEMINI_API_KEY || '';
+}
+
+// Module-level client — updated whenever the key changes
+let ai = createAiClient(getStoredGeminiKey());
 
 interface Message {
   id: string;
@@ -267,6 +278,9 @@ export default function App() {
   const [showSplash, setShowSplash] = useState(true);
   const [user, setUser] = useState<FirebaseUser | null>(null);
   const [isAuthReady, setIsAuthReady] = useState(false);
+  const [geminiApiKey, setGeminiApiKey] = useState<string>(getStoredGeminiKey);
+  const [geminiKeyInput, setGeminiKeyInput] = useState('');
+  const [showGeminiKeyInput, setShowGeminiKeyInput] = useState(false);
   const [messages, setMessages] = useState<Message[]>([]);
   const [input, setInput] = useState('');
   const [isLoading, setIsLoading] = useState(false);
@@ -561,11 +575,23 @@ export default function App() {
   }, [isTimerRunning, timeLeft, user, sessionDuration, userSettings, selectedSubject, timerMode, isBreak, isTimerActive]);
 
   const startTimer = () => {
+    if (!sessionTopic.trim() || !sessionGoal.trim()) return;
+    // Sync subject from customSubject if filled
+    if (customSubject.trim()) {
+      setSelectedSubject(customSubject.trim());
+    }
     setTimeLeft(sessionDuration * 60);
     setIsTimerRunning(true);
     setIsTimerActive(true);
     setIsSessionSetupOpen(false);
-    setInput(`I'm starting a ${sessionDuration} minute study session on ${sessionTopic} (${selectedSubject}). My goal is: ${sessionGoal}. Let's focus!`);
+    // Auto-send an opening message to the AI
+    const openingMsg = `I'm starting a ${sessionDuration}-minute ${timerMode} study session on "${sessionTopic}" (${customSubject.trim() || selectedSubject}). My goal: ${sessionGoal}. Please give me a brief motivational kickoff and one key tip for this topic.`;
+    setInput(openingMsg);
+    // Use setTimeout so the input state is set before handleSend reads it
+    setTimeout(() => {
+      const btn = document.getElementById('chat-send-btn');
+      btn?.click();
+    }, 100);
   };
 
   const toggleTimer = () => setIsTimerRunning(!isTimerRunning);
@@ -622,7 +648,7 @@ export default function App() {
       ]`;
 
       const response = await ai.models.generateContent({
-        model: "gemini-3-flash-preview",
+        model: "gemini-2.5-flash-lite",
         contents: prompt,
         config: {
           responseMimeType: "application/json",
@@ -693,12 +719,15 @@ export default function App() {
       toast.error("Please provide a topic or notes.");
       return;
     }
+    if (!geminiApiKey) {
+      toast.error("Gemini API key not set. Add it in Settings.");
+      return;
+    }
 
     setIsGeneratingQuiz(true);
     try {
-      const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY! });
       const model = ai.models.generateContent({
-        model: "gemini-3-flash-preview",
+        model: "gemini-2.5-flash-lite",
         config: {
           responseMimeType: "application/json",
           responseSchema: {
@@ -834,12 +863,15 @@ export default function App() {
       toast.error("Please provide a topic or notes.");
       return;
     }
+    if (!geminiApiKey) {
+      toast.error("Gemini API key not set. Add it in Settings.");
+      return;
+    }
 
     setIsGeneratingSummary(true);
     try {
-      const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY! });
       const model = ai.models.generateContent({
-        model: "gemini-3-flash-preview",
+        model: "gemini-2.5-flash-lite",
         contents: `Summarize the following notes into ${summaryType}. 
         Topic: ${summaryTopic || 'General'}.
         Subject: ${selectedSubject}.
@@ -905,11 +937,14 @@ export default function App() {
 
   const generateWeeklyPlan = async () => {
     if (!user) return;
+    if (!geminiApiKey) {
+      toast.error("Gemini API key not set. Add it in Settings.");
+      return;
+    }
     setIsGeneratingPlan(true);
     try {
-      const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY! });
       const response = await ai.models.generateContent({
-        model: "gemini-3-flash-preview",
+        model: "gemini-2.5-flash-lite",
         config: {
           responseMimeType: "application/json",
           responseSchema: {
@@ -1171,6 +1206,16 @@ export default function App() {
     scrollToBottom();
   }, [messages]);
 
+  const saveGeminiKey = (key: string) => {
+    const trimmed = key.trim();
+    localStorage.setItem(GEMINI_KEY_STORAGE, trimmed);
+    ai = createAiClient(trimmed);
+    setGeminiApiKey(trimmed);
+    setGeminiKeyInput('');
+    setShowGeminiKeyInput(false);
+    if (trimmed) toast.success('Gemini API key saved!');
+  };
+
   const handleLogin = (mode: 'signin' | 'signup' = 'signin') => {
     setIsAuthModalOpen(true);
     setAuthMode(mode);
@@ -1183,28 +1228,33 @@ export default function App() {
       const userCredential = await signInWithPopup(auth, googleProvider);
       const user = userCredential.user;
       
-      // Explicitly initialize user data if it doesn't exist
-      const userDocRef = doc(db, 'users', user.uid);
-      const docSnap = await getDoc(userDocRef);
-      
-      if (!docSnap.exists()) {
-        const initialSettings = {
-          ...DEFAULT_SETTINGS,
-          displayName: user.displayName || 'Student',
-          email: user.email || '',
-          updatedAt: serverTimestamp()
-        };
-        await setDoc(userDocRef, initialSettings);
+      // Initialize user data in Firestore if it doesn't exist (best-effort)
+      try {
+        const userDocRef = doc(db, 'users', user.uid);
+        const docSnap = await getDoc(userDocRef);
+        if (!docSnap.exists()) {
+          const initialSettings = {
+            ...DEFAULT_SETTINGS,
+            displayName: user.displayName || 'Student',
+            email: user.email || '',
+            updatedAt: serverTimestamp()
+          };
+          await setDoc(userDocRef, initialSettings);
+        }
+      } catch (firestoreErr) {
+        // Non-fatal: auth succeeded, Firestore will be retried via onSnapshot
+        console.warn("Could not initialize user data:", firestoreErr);
       }
       
       setIsAuthModalOpen(false);
       setError(null);
+      toast.success(`Welcome, ${user.displayName || 'Student'}!`);
     } catch (error: any) {
       if (error.code === 'auth/cancelled-popup-request' || error.code === 'auth/popup-closed-by-user') {
         return;
       }
       console.error("Login error:", error);
-      setError("Failed to sign in. Please try again.");
+      setError("Failed to sign in with Google. Please try again.");
     } finally {
       setIsLoggingIn(false);
     }
@@ -1225,15 +1275,19 @@ export default function App() {
           await updateProfile(user, { displayName });
         }
         
-        // Explicitly initialize user data in Firestore
-        const userDocRef = doc(db, 'users', user.uid);
-        const initialSettings = {
-          ...DEFAULT_SETTINGS,
-          displayName: displayName || 'Student',
-          email: email,
-          updatedAt: serverTimestamp()
-        };
-        await setDoc(userDocRef, initialSettings);
+        // Initialize user data in Firestore (best-effort — auth already succeeded)
+        try {
+          const userDocRef = doc(db, 'users', user.uid);
+          const initialSettings = {
+            ...DEFAULT_SETTINGS,
+            displayName: displayName || 'Student',
+            email: email,
+            updatedAt: serverTimestamp()
+          };
+          await setDoc(userDocRef, initialSettings);
+        } catch (firestoreErr) {
+          console.warn("Could not initialize user data:", firestoreErr);
+        }
         
         toast.success("Account created successfully!");
       } else {
@@ -1250,8 +1304,12 @@ export default function App() {
         setError("This email is already in use.");
       } else if (error.code === 'auth/weak-password') {
         setError("Password should be at least 6 characters.");
-      } else if (error.code === 'auth/invalid-credential') {
+      } else if (error.code === 'auth/invalid-credential' || error.code === 'auth/wrong-password' || error.code === 'auth/user-not-found') {
         setError("Invalid email or password.");
+      } else if (error.code === 'auth/invalid-email') {
+        setError("Please enter a valid email address.");
+      } else if (error.code === 'auth/too-many-requests') {
+        setError("Too many failed attempts. Please try again later.");
       } else {
         setError("Authentication failed. Please try again.");
       }
@@ -1272,11 +1330,15 @@ export default function App() {
 
   const handleAiSearch = async () => {
     if (!aiSearchInput.trim() || isSearchingAi) return;
+    if (!geminiApiKey) {
+      setAiSearchResponse("Gemini API key not set. Please add it in Settings.");
+      return;
+    }
     setIsSearchingAi(true);
     setAiSearchResponse('');
     try {
       const response = await ai.models.generateContent({
-        model: "gemini-3-flash-preview",
+        model: "gemini-2.5-flash-lite",
         contents: [{ role: 'user', parts: [{ text: aiSearchInput }] }],
         config: {
           systemInstruction: `You are 'Study Focus', a quick academic lookup tool. Provide a concise, accurate answer to the user's question. They are currently in a focused study session for: ${sessionTopic}. Their goal is: ${sessionGoal}. Keep your response helpful but brief so they can get back to studying quickly.`,
@@ -1285,7 +1347,7 @@ export default function App() {
       setAiSearchResponse(response.text || "No response generated.");
     } catch (err) {
       console.error("AI Search error:", err);
-      setAiSearchResponse("Failed to get response. Please try again.");
+      setAiSearchResponse("Failed to get response. Please check your API key and try again.");
     } finally {
       setIsSearchingAi(false);
     }
@@ -1293,11 +1355,15 @@ export default function App() {
 
   const generateSuggestedTopics = async () => {
     if (!customSubject.trim() || isGeneratingTopics) return;
+    if (!geminiApiKey) {
+      toast.error("Gemini API key not set. Add it in Settings.");
+      return;
+    }
     setIsGeneratingTopics(true);
     setSuggestedTopics([]);
     try {
       const response = await ai.models.generateContent({
-        model: "gemini-3-flash-preview",
+        model: "gemini-2.5-flash-lite",
         contents: [{ role: 'user', parts: [{ text: `Generate 5 specific study topics or sub-topics for the subject: ${customSubject}. Return only a comma-separated list of topics.` }] }],
         config: {
           systemInstruction: "You are an academic advisor. Provide 5 specific, high-value study topics for the given subject. Return only the topics separated by commas, no other text.",
@@ -1331,6 +1397,11 @@ export default function App() {
       }
     }
 
+    if (!geminiApiKey) {
+      setError("Gemini API key not set. Please add it in Settings to use the AI assistant.");
+      return;
+    }
+
     setInput('');
     setIsLoading(true);
 
@@ -1345,7 +1416,7 @@ export default function App() {
       });
 
       const response = await ai.models.generateContent({
-        model: "gemini-3-flash-preview",
+        model: "gemini-2.5-flash-lite",
         contents: [...messages, { role: 'user', content: userContent }].map(m => ({
           role: m.role === 'assistant' ? 'model' : 'user',
           parts: [{ text: m.content }]
@@ -1377,13 +1448,14 @@ export default function App() {
       });
 
       setError(null);
-    } catch (err) {
+    } catch (err: any) {
       console.error("Error generating content:", err);
-      setError("Failed to generate response. Please check your connection and try again.");
-      try {
-        handleFirestoreError(err, OperationType.WRITE, 'messages');
-      } catch (e) {
-        // Error already logged by handleFirestoreError
+      if (err?.message?.includes('API_KEY_INVALID') || err?.message?.includes('API key not valid')) {
+        setError("Invalid Gemini API key. Please update it in Settings.");
+      } else if (err?.message?.includes('QUOTA_EXCEEDED') || err?.message?.includes('quota')) {
+        setError("Gemini API quota exceeded. Please check your usage or try again later.");
+      } else {
+        setError("Failed to generate response. Please check your connection and try again.");
       }
     } finally {
       setIsLoading(false);
@@ -1427,8 +1499,26 @@ export default function App() {
       setError(null);
     } catch (err) {
       console.error("Error updating settings:", err);
-      setError("Failed to save settings. Please try again.");
-      handleFirestoreError(err, OperationType.UPDATE, `users/${user.uid}`);
+      // Log Firestore error details without re-throwing
+      const errInfo: FirestoreErrorInfo = {
+        error: err instanceof Error ? err.message : String(err),
+        authInfo: {
+          userId: auth.currentUser?.uid,
+          email: auth.currentUser?.email,
+          emailVerified: auth.currentUser?.emailVerified,
+          isAnonymous: auth.currentUser?.isAnonymous,
+          tenantId: auth.currentUser?.tenantId,
+          providerInfo: auth.currentUser?.providerData.map(provider => ({
+            providerId: provider.providerId,
+            displayName: provider.displayName,
+            email: provider.email,
+            photoUrl: provider.photoURL
+          })) || []
+        },
+        operationType: OperationType.UPDATE,
+        path: `users/${user.uid}`
+      };
+      console.error('Firestore Error: ', JSON.stringify(errInfo));
     }
   };
 
@@ -2609,6 +2699,7 @@ export default function App() {
               rows={1}
             />
             <button
+              id="chat-send-btn"
               onClick={handleSend}
               disabled={!input.trim() || isLoading || !user}
               className={`p-2.5 rounded-xl transition-all duration-200 ${
@@ -2637,7 +2728,7 @@ export default function App() {
               initial={{ opacity: 0 }}
               animate={{ opacity: 1 }}
               exit={{ opacity: 0 }}
-              onClick={() => setIsAuthModalOpen(false)}
+              onClick={() => { setIsAuthModalOpen(false); setError(null); }}
               className="absolute inset-0 bg-black/60 backdrop-blur-sm"
             />
             <motion.div 
@@ -2651,7 +2742,7 @@ export default function App() {
                   {authMode === 'signin' ? 'Sign In' : 'Create Account'}
                 </h2>
                 <button 
-                  onClick={() => setIsAuthModalOpen(false)}
+                  onClick={() => { setIsAuthModalOpen(false); setError(null); }}
                   className={`p-2 ${userSettings.theme === 'dark' ? 'text-zinc-500 hover:text-white hover:bg-zinc-800' : 'text-zinc-400 hover:text-zinc-900 hover:bg-zinc-100'} rounded-lg transition-all`}
                 >
                   <X className="w-5 h-5" />
@@ -2679,7 +2770,7 @@ export default function App() {
                       type="email" 
                       required
                       value={email}
-                      onChange={(e) => setEmail(e.target.value)}
+                      onChange={(e) => { setEmail(e.target.value); setError(null); }}
                       placeholder="you@example.com"
                       className={`w-full ${userSettings.theme === 'dark' ? 'bg-zinc-950 border-zinc-800 text-white' : 'bg-zinc-50 border-zinc-200 text-zinc-900'} border rounded-xl px-4 py-3 text-sm focus:ring-1 focus:ring-indigo-500 outline-none transition-all`}
                     />
@@ -2690,11 +2781,16 @@ export default function App() {
                       type="password" 
                       required
                       value={password}
-                      onChange={(e) => setPassword(e.target.value)}
+                      onChange={(e) => { setPassword(e.target.value); setError(null); }}
                       placeholder="••••••••"
                       className={`w-full ${userSettings.theme === 'dark' ? 'bg-zinc-950 border-zinc-800 text-white' : 'bg-zinc-50 border-zinc-200 text-zinc-900'} border rounded-xl px-4 py-3 text-sm focus:ring-1 focus:ring-indigo-500 outline-none transition-all`}
                     />
                   </div>
+                  {error && (
+                    <div className="flex items-center gap-2 px-3 py-2 bg-red-500/10 border border-red-500/20 rounded-xl">
+                      <span className="text-xs text-red-400">{error}</span>
+                    </div>
+                  )}
                   <button 
                     type="submit"
                     disabled={isLoggingIn}
@@ -2730,7 +2826,7 @@ export default function App() {
 
                 <div className="text-center">
                   <button 
-                    onClick={() => setAuthMode(authMode === 'signin' ? 'signup' : 'signin')}
+                    onClick={() => { setAuthMode(authMode === 'signin' ? 'signup' : 'signin'); setError(null); }}
                     className="text-sm text-zinc-500 hover:text-indigo-400 transition-colors"
                   >
                     {authMode === 'signin' ? "Don't have an account? Create one" : "Already have an account? Sign in"}
@@ -3489,7 +3585,8 @@ export default function App() {
               exit={{ opacity: 0, scale: 0.9, y: 20 }}
               className={`relative w-full max-w-xl ${userSettings.theme === 'dark' ? 'bg-zinc-900 border-zinc-800' : 'bg-white border-zinc-200'} border rounded-[2.5rem] shadow-2xl overflow-hidden flex flex-col max-h-[90vh] transition-colors duration-500`}
             >
-              <div className={`p-6 border-b ${userSettings.theme === 'dark' ? 'border-zinc-800 bg-zinc-900/50' : 'border-zinc-100 bg-white/50'} backdrop-blur-md sticky top-0 z-10`}>
+              {/* Header */}
+              <div className={`flex items-center justify-between p-6 border-b ${userSettings.theme === 'dark' ? 'border-zinc-800 bg-zinc-900/50' : 'border-zinc-100 bg-white/50'} backdrop-blur-md sticky top-0 z-10`}>
                 <div className="flex items-center gap-3">
                   <div className="w-10 h-10 rounded-2xl bg-indigo-600/20 flex items-center justify-center">
                     <Target className="w-5 h-5 text-indigo-400" />
@@ -3507,9 +3604,10 @@ export default function App() {
                 </button>
               </div>
 
-              <div className="flex-1 overflow-y-auto p-8 space-y-8 scrollbar-thin scrollbar-thumb-zinc-800">
-                {/* Timer Modes */}
-                <div className="space-y-4">
+              <div className={`flex-1 overflow-y-auto p-6 space-y-6 scrollbar-thin ${userSettings.theme === 'dark' ? 'scrollbar-thumb-zinc-800' : 'scrollbar-thumb-zinc-200'}`}>
+
+                {/* Timer Mode */}
+                <div className="space-y-3">
                   <label className="text-xs font-bold text-zinc-500 uppercase tracking-widest">Timer Mode</label>
                   <div className="grid grid-cols-3 gap-3">
                     {(['Pomodoro', 'Deep Study', 'Custom'] as const).map((mode) => (
@@ -3523,24 +3621,29 @@ export default function App() {
                         className={`py-4 rounded-2xl text-xs font-bold transition-all border flex flex-col items-center gap-2 ${
                           timerMode === mode 
                             ? 'bg-indigo-600/10 border-indigo-500 text-indigo-400 shadow-lg shadow-indigo-900/20' 
-                            : userSettings.theme === 'dark' ? 'bg-zinc-950 border-zinc-800 text-zinc-500 hover:border-zinc-700' : 'bg-zinc-50 border-zinc-200 text-zinc-500 hover:border-zinc-300'
+                            : userSettings.theme === 'dark' 
+                              ? 'bg-zinc-950 border-zinc-800 text-zinc-500 hover:border-zinc-700' 
+                              : 'bg-zinc-50 border-zinc-200 text-zinc-500 hover:border-zinc-300'
                         }`}
                       >
                         {mode === 'Pomodoro' && <Clock className="w-4 h-4" />}
                         {mode === 'Deep Study' && <Target className="w-4 h-4" />}
                         {mode === 'Custom' && <Settings className="w-4 h-4" />}
-                        {mode}
+                        <span>{mode}</span>
+                        <span className={`text-[10px] font-normal ${timerMode === mode ? 'text-indigo-300' : 'text-zinc-600'}`}>
+                          {mode === 'Pomodoro' ? '25 min' : mode === 'Deep Study' ? '50 min' : `${sessionDuration} min`}
+                        </span>
                       </button>
                     ))}
                   </div>
                 </div>
 
-                {/* Duration Slider (only for Custom) */}
+                {/* Duration Slider — Custom only */}
                 {timerMode === 'Custom' && (
-                  <div className="space-y-4">
+                  <div className="space-y-3">
                     <div className="flex items-center justify-between">
                       <label className="text-xs font-bold text-zinc-500 uppercase tracking-widest">Duration</label>
-                      <span className={`text-lg font-serif italic ${userSettings.theme === 'dark' ? 'text-white' : 'text-zinc-900'}`}>{sessionDuration}m</span>
+                      <span className={`text-lg font-serif italic font-bold ${userSettings.theme === 'dark' ? 'text-white' : 'text-zinc-900'}`}>{sessionDuration} min</span>
                     </div>
                     <input 
                       type="range" 
@@ -3549,39 +3652,64 @@ export default function App() {
                       step="5"
                       value={sessionDuration}
                       onChange={(e) => setSessionDuration(parseInt(e.target.value))}
-                      className={`w-full accent-indigo-500 h-1.5 ${userSettings.theme === 'dark' ? 'bg-zinc-800' : 'bg-zinc-100'} rounded-full appearance-none cursor-pointer`}
+                      className={`w-full accent-indigo-500 h-2 ${userSettings.theme === 'dark' ? 'bg-zinc-800' : 'bg-zinc-200'} rounded-full appearance-none cursor-pointer`}
                     />
+                    <div className="flex justify-between text-[10px] text-zinc-600 font-medium">
+                      <span>5 min</span>
+                      <span>90 min</span>
+                      <span>180 min</span>
+                    </div>
                   </div>
                 )}
 
-                {/* Subject Input & Topic Generation */}
-                <div className="space-y-4">
+                {/* Subject */}
+                <div className="space-y-3">
                   <label className="text-xs font-bold text-zinc-500 uppercase tracking-widest">Subject</label>
+                  {/* Quick-pick from saved subjects */}
+                  <div className="flex flex-wrap gap-2">
+                    {userSettings.subjects.map((s) => (
+                      <button
+                        key={s}
+                        onClick={() => { setCustomSubject(s); setSelectedSubject(s); }}
+                        className={`px-3 py-1.5 rounded-xl text-xs font-bold transition-all border ${
+                          (customSubject || selectedSubject) === s
+                            ? 'bg-indigo-600 text-white border-indigo-600'
+                            : userSettings.theme === 'dark'
+                              ? 'bg-zinc-800 border-zinc-700 text-zinc-400 hover:border-zinc-600'
+                              : 'bg-zinc-100 border-zinc-200 text-zinc-600 hover:border-zinc-300'
+                        }`}
+                      >
+                        {s}
+                      </button>
+                    ))}
+                  </div>
+                  {/* Or type a custom subject */}
                   <div className="flex gap-2">
                     <input 
                       type="text" 
-                      placeholder="Enter subject (e.g. Physics, History...)"
+                      placeholder="Or type a custom subject..."
                       value={customSubject}
-                      onChange={(e) => setCustomSubject(e.target.value)}
-                      className="flex-1 bg-zinc-950 border border-zinc-800 rounded-xl px-4 py-3 text-sm focus:ring-2 focus:ring-indigo-500 outline-none transition-all placeholder:text-zinc-700 text-white"
+                      onChange={(e) => { setCustomSubject(e.target.value); }}
+                      className={`flex-1 ${userSettings.theme === 'dark' ? 'bg-zinc-950 border-zinc-800 text-white placeholder-zinc-600' : 'bg-zinc-50 border-zinc-200 text-zinc-900 placeholder-zinc-400'} border rounded-xl px-4 py-2.5 text-sm focus:ring-2 focus:ring-indigo-500 outline-none transition-all`}
                     />
                     <button 
                       onClick={generateSuggestedTopics}
                       disabled={!customSubject.trim() || isGeneratingTopics}
-                      className="px-4 py-3 bg-indigo-600/10 border border-indigo-500/30 text-indigo-400 rounded-xl text-xs font-bold hover:bg-indigo-600/20 disabled:opacity-50 transition-all flex items-center gap-2"
+                      className="px-4 py-2.5 bg-indigo-600/10 border border-indigo-500/30 text-indigo-400 rounded-xl text-xs font-bold hover:bg-indigo-600/20 disabled:opacity-40 transition-all flex items-center gap-2 whitespace-nowrap"
                     >
                       {isGeneratingTopics ? <Loader2 className="w-4 h-4 animate-spin" /> : <Brain className="w-4 h-4" />}
-                      Generate Topics
+                      AI Topics
                     </button>
                   </div>
 
+                  {/* AI-suggested topics */}
                   {suggestedTopics.length > 0 && (
                     <motion.div 
-                      initial={{ opacity: 0, y: 10 }}
+                      initial={{ opacity: 0, y: 8 }}
                       animate={{ opacity: 1, y: 0 }}
                       className="space-y-2"
                     >
-                      <label className="text-[10px] font-bold text-zinc-600 uppercase tracking-widest">Suggested Topics</label>
+                      <label className="text-[10px] font-bold text-zinc-500 uppercase tracking-widest">Suggested Topics — click to use</label>
                       <div className="flex flex-wrap gap-2">
                         {suggestedTopics.map((topic, i) => (
                           <button
@@ -3590,7 +3718,9 @@ export default function App() {
                             className={`px-3 py-1.5 rounded-lg text-[11px] font-medium transition-all border ${
                               sessionTopic === topic 
                                 ? 'bg-indigo-600 text-white border-indigo-600 shadow-md' 
-                                : 'bg-zinc-900 border-zinc-800 text-zinc-400 hover:border-zinc-700'
+                                : userSettings.theme === 'dark'
+                                  ? 'bg-zinc-900 border-zinc-800 text-zinc-400 hover:border-zinc-700'
+                                  : 'bg-zinc-100 border-zinc-200 text-zinc-600 hover:border-zinc-300'
                             }`}
                           >
                             {topic}
@@ -3601,36 +3731,64 @@ export default function App() {
                   )}
                 </div>
 
-                {/* Topic & Goal */}
-                <div className="space-y-6">
-                  <div className="space-y-3">
-                    <label className="text-xs font-bold text-zinc-500 uppercase tracking-widest">What are you studying?</label>
-                    <input 
-                      type="text" 
-                      placeholder="e.g. Linear Algebra, User Research..."
-                      value={sessionTopic}
-                      onChange={(e) => setSessionTopic(e.target.value)}
-                      className="w-full bg-zinc-950 border border-zinc-800 rounded-2xl px-5 py-4 text-sm focus:ring-2 focus:ring-indigo-500 outline-none transition-all placeholder:text-zinc-700"
-                    />
-                  </div>
-                  <div className="space-y-3">
-                    <label className="text-xs font-bold text-zinc-500 uppercase tracking-widest">Session Goal</label>
-                    <textarea 
-                      placeholder="e.g. Complete 3 practice problems, Read chapter 4..."
-                      value={sessionGoal}
-                      onChange={(e) => setSessionGoal(e.target.value)}
-                      className="w-full bg-zinc-950 border border-zinc-800 rounded-2xl px-5 py-4 text-sm focus:ring-2 focus:ring-indigo-500 outline-none transition-all h-24 resize-none placeholder:text-zinc-700"
-                    />
-                  </div>
+                {/* What are you studying */}
+                <div className="space-y-3">
+                  <label className="text-xs font-bold text-zinc-500 uppercase tracking-widest">What are you studying?</label>
+                  <input 
+                    type="text" 
+                    placeholder="e.g. Linear Algebra, Photosynthesis, World War II..."
+                    value={sessionTopic}
+                    onChange={(e) => setSessionTopic(e.target.value)}
+                    className={`w-full ${userSettings.theme === 'dark' ? 'bg-zinc-950 border-zinc-800 text-white placeholder-zinc-600' : 'bg-zinc-50 border-zinc-200 text-zinc-900 placeholder-zinc-400'} border rounded-2xl px-5 py-4 text-sm focus:ring-2 focus:ring-indigo-500 outline-none transition-all`}
+                  />
                 </div>
 
+                {/* Session Goal */}
+                <div className="space-y-3">
+                  <label className="text-xs font-bold text-zinc-500 uppercase tracking-widest">Session Goal</label>
+                  <textarea 
+                    placeholder="e.g. Complete 3 practice problems, Read chapter 4, Memorise key formulas..."
+                    value={sessionGoal}
+                    onChange={(e) => setSessionGoal(e.target.value)}
+                    rows={3}
+                    className={`w-full ${userSettings.theme === 'dark' ? 'bg-zinc-950 border-zinc-800 text-white placeholder-zinc-600' : 'bg-zinc-50 border-zinc-200 text-zinc-900 placeholder-zinc-400'} border rounded-2xl px-5 py-4 text-sm focus:ring-2 focus:ring-indigo-500 outline-none transition-all resize-none`}
+                  />
+                </div>
+
+                {/* Summary card before starting */}
+                {sessionTopic && sessionGoal && (
+                  <motion.div
+                    initial={{ opacity: 0, y: 8 }}
+                    animate={{ opacity: 1, y: 0 }}
+                    className="p-4 bg-indigo-600/10 border border-indigo-500/20 rounded-2xl space-y-2"
+                  >
+                    <p className="text-[10px] font-bold text-indigo-400 uppercase tracking-widest">Session Preview</p>
+                    <div className="flex items-center gap-3 flex-wrap">
+                      <span className={`flex items-center gap-1.5 text-xs font-medium ${userSettings.theme === 'dark' ? 'text-zinc-300' : 'text-zinc-700'}`}>
+                        <Clock className="w-3.5 h-3.5 text-indigo-400" />
+                        {sessionDuration} min · {timerMode}
+                      </span>
+                      <span className={`flex items-center gap-1.5 text-xs font-medium ${userSettings.theme === 'dark' ? 'text-zinc-300' : 'text-zinc-700'}`}>
+                        <BookOpen className="w-3.5 h-3.5 text-indigo-400" />
+                        {customSubject || selectedSubject}
+                      </span>
+                    </div>
+                    <p className={`text-xs ${userSettings.theme === 'dark' ? 'text-zinc-400' : 'text-zinc-600'}`}>
+                      <span className="font-semibold text-indigo-300">{sessionTopic}</span> — {sessionGoal}
+                    </p>
+                  </motion.div>
+                )}
+
+                {/* Start Button */}
                 <button 
                   onClick={startTimer}
-                  disabled={!sessionTopic || !sessionGoal}
-                  className="w-full py-5 bg-indigo-600 hover:bg-indigo-500 disabled:bg-zinc-800 disabled:text-zinc-500 text-white rounded-2xl font-bold transition-all shadow-xl shadow-indigo-900/40 flex items-center justify-center gap-3"
+                  disabled={!sessionTopic.trim() || !sessionGoal.trim()}
+                  className="w-full py-5 bg-indigo-600 hover:bg-indigo-500 disabled:bg-zinc-800 disabled:text-zinc-500 text-white rounded-2xl font-bold transition-all shadow-xl shadow-indigo-900/40 flex items-center justify-center gap-3 text-sm"
                 >
                   <Sparkles className="w-5 h-5" />
-                  Start Focus Session
+                  {!sessionTopic.trim() || !sessionGoal.trim() 
+                    ? 'Fill in topic & goal to start' 
+                    : `Start ${sessionDuration}-min Focus Session`}
                 </button>
               </div>
             </motion.div>
@@ -4057,6 +4215,74 @@ export default function App() {
                       className={`w-full ${userSettings.theme === 'dark' ? 'bg-zinc-950 border-zinc-800 text-white' : 'bg-zinc-50 border-zinc-200 text-zinc-900'} border rounded-xl px-4 py-2 text-sm focus:ring-1 focus:ring-indigo-500 outline-none transition-all`}
                     />
                   </div>
+                </section>
+
+                {/* Gemini API Key Section */}
+                <section className={`space-y-4 pt-4 border-t ${userSettings.theme === 'dark' ? 'border-zinc-800' : 'border-zinc-100'}`}>
+                  <div className="flex items-center gap-2 text-xs font-bold text-zinc-500 uppercase tracking-widest">
+                    <Zap className="w-3 h-3" />
+                    Gemini AI
+                  </div>
+                  <div className={`flex items-center gap-2 px-3 py-2 rounded-xl ${
+                    geminiApiKey
+                      ? 'bg-emerald-500/10 border border-emerald-500/20'
+                      : 'bg-amber-500/10 border border-amber-500/20'
+                  }`}>
+                    <div className={`w-2 h-2 rounded-full ${geminiApiKey ? 'bg-emerald-400' : 'bg-amber-400 animate-pulse'}`} />
+                    <span className={`text-xs font-medium ${geminiApiKey ? 'text-emerald-400' : 'text-amber-400'}`}>
+                      {geminiApiKey ? 'API key configured' : 'API key required for AI features'}
+                    </span>
+                  </div>
+                  {showGeminiKeyInput ? (
+                    <div className="space-y-2">
+                      <input
+                        type="password"
+                        value={geminiKeyInput}
+                        onChange={(e) => setGeminiKeyInput(e.target.value)}
+                        placeholder="Paste your Gemini API key..."
+                        autoFocus
+                        className={`w-full ${userSettings.theme === 'dark' ? 'bg-zinc-950 border-zinc-800 text-white placeholder-zinc-600' : 'bg-zinc-50 border-zinc-200 text-zinc-900 placeholder-zinc-400'} border rounded-xl px-4 py-2 text-sm font-mono focus:ring-1 focus:ring-indigo-500 outline-none transition-all`}
+                      />
+                      <div className="flex gap-2">
+                        <button
+                          onClick={() => saveGeminiKey(geminiKeyInput)}
+                          disabled={!geminiKeyInput.trim()}
+                          className="flex-1 py-2 bg-indigo-600 hover:bg-indigo-500 disabled:bg-zinc-800 disabled:text-zinc-500 text-white rounded-xl text-xs font-bold transition-all"
+                        >
+                          Save Key
+                        </button>
+                        <button
+                          onClick={() => { setShowGeminiKeyInput(false); setGeminiKeyInput(''); }}
+                          className={`px-4 py-2 ${userSettings.theme === 'dark' ? 'bg-zinc-800 hover:bg-zinc-700 text-zinc-400' : 'bg-zinc-100 hover:bg-zinc-200 text-zinc-600'} rounded-xl text-xs font-bold transition-all`}
+                        >
+                          Cancel
+                        </button>
+                      </div>
+                      <p className={`text-[10px] ${userSettings.theme === 'dark' ? 'text-zinc-600' : 'text-zinc-400'}`}>
+                        Get a free key at{' '}
+                        <a href="https://aistudio.google.com/apikey" target="_blank" rel="noopener noreferrer" className="text-indigo-400 hover:underline">
+                          aistudio.google.com/apikey
+                        </a>
+                      </p>
+                    </div>
+                  ) : (
+                    <div className="flex gap-2">
+                      <button
+                        onClick={() => setShowGeminiKeyInput(true)}
+                        className={`flex-1 py-2 ${userSettings.theme === 'dark' ? 'bg-zinc-800 hover:bg-zinc-700 text-zinc-300' : 'bg-zinc-100 hover:bg-zinc-200 text-zinc-700'} rounded-xl text-xs font-bold transition-all`}
+                      >
+                        {geminiApiKey ? 'Update API Key' : 'Add API Key'}
+                      </button>
+                      {geminiApiKey && (
+                        <button
+                          onClick={() => saveGeminiKey('')}
+                          className="px-4 py-2 bg-red-500/10 hover:bg-red-500/20 text-red-400 rounded-xl text-xs font-bold transition-all border border-red-500/20"
+                        >
+                          Remove
+                        </button>
+                      )}
+                    </div>
+                  )}
                 </section>
                 
                 {/* Appearance Section */}
